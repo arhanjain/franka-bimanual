@@ -224,11 +224,8 @@ class Gello(Teleoperator):
                     self.latest_action = self._process_action(raw)
                 return self.latest_action.copy()
 
-        start = time.perf_counter()
         raw = self.bus.sync_read("Present_Position", normalize=False)
-        result = self._process_action(raw)
-        print(f"bus.sync_read took {time.perf_counter() - start} seconds")
-        return result
+        return self._process_action(raw)
 
     def send_feedback(self, feedback: dict[str, float]) -> None:
         # TODO(rcadene, aliberts): Implement force feedback.

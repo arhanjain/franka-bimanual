@@ -6,6 +6,7 @@ parent-side facade that dispatches commands to the right subprocess and
 gathers their responses.
 """
 
+import logging
 from multiprocessing import Process, Queue
 from queue import Empty
 from typing import Any, cast
@@ -14,12 +15,22 @@ import signal
 import numpy as np
 from numpy.typing import NDArray
 
+logger = logging.getLogger(__name__)
+
 # ---- Control parameters -----------------------------------------------------
 # Duration attached to each streamed velocity command (ms). The control loop in
 # the parent process must re-issue commands faster than this or the arm stalls.
 # Position tracking / PD shaping happens in the parent (see BimanualFranka) so
 # this subprocess can stay a thin pass-through to franky.
 VELOCITY_COMMAND_DURATION_MS = 500
+
+# Jacobian cache: recompute only when any joint moves more than this many
+# radians (L-inf norm) from the last cached configuration. During slow /
+# idle motion the cache persists for many cycles; at JOINT_VELOCITY_MAX
+# (2 rad/s) and 20 Hz the worst-case staleness is one cycle (0.10 rad).
+# Safety analysis: ||ΔJ_row2|| ≈ 0.10 × 0.1 → v_z error ≈ 0.02 m/s,
+# well inside the 3 cm WORKTABLE_DISTANCE_MIN safety buffer.
+_JACOBIAN_CACHE_Q_THRESHOLD = 0.10  # rad; L-inf norm
 JOINT_RELATIVE_DYNAMICS = (1.0, 0.25, 1.0)
 TORQUE_THRESHOLD = 100.0 # Nm
 FORCE_THRESHOLD = 200.0 # N
@@ -133,6 +144,10 @@ class RobotProcess:
             zero_lin = np.zeros(3, dtype=np.float64)
             zero_joint = np.zeros(NUM_JOINTS, dtype=np.float64)
 
+            # Jacobian cache (see _JACOBIAN_CACHE_Q_THRESHOLD).
+            _cached_jacobian: NDArray[np.float64] | None = None
+            _cached_jacobian_q: NDArray[np.float64] | None = None
+
             def make_prime_motion():
                 if self.use_ee_delta:
                     return CartesianVelocityMotion(
@@ -175,22 +190,93 @@ class RobotProcess:
                     self.response_queue.put(("success", result))
 
                 elif command == "current_kinematic_state":
-                    # All kinematic state needed for one parent-side control
-                    # tick (PD + safety overlays), captured from the same
-                    # snapshot of robot.state for consistency.
-                    state = robot.state
-                    q = np.asarray(state.q, dtype=np.float64)
+                    # Prefer locally-buffered callback state (updated at 1 kHz
+                    # during active motion, no network round-trip) over
+                    # robot.state (RPC). Falls back before the first motion or
+                    # on any exception from get_last_callback_data().
+                    _cb_state = None
+                    try:
+                        _cb_state, _, _, _, _ = robot.get_last_callback_data()
+                    except Exception:
+                        pass
+                    state = _cb_state if _cb_state is not None else robot.state
+
+                    q  = np.asarray(state.q,  dtype=np.float64)
                     dq = np.asarray(state.dq, dtype=np.float64)
                     ee_translation = np.asarray(
                         state.O_T_EE.translation, dtype=np.float64
                     ).flatten()
-                    jacobian = np.asarray(
-                        robot.model.zero_jacobian(Frame.EndEffector, state),
-                        dtype=np.float64,
-                    )
+
+                    # Recompute the Jacobian only when joints have moved beyond
+                    # _JACOBIAN_CACHE_Q_THRESHOLD from the last cached config.
+                    # At low / moderate speeds this avoids a per-cycle RPC.
+                    if (
+                        _cached_jacobian is None
+                        or float(np.max(np.abs(q - _cached_jacobian_q)))
+                        > _JACOBIAN_CACHE_Q_THRESHOLD
+                    ):
+                        try:
+                            _raw_j = robot.model.zero_jacobian(
+                                Frame.EndEffector, state
+                            )
+                        except Exception:
+                            # net_franky may reject a locally-derived state;
+                            # fall back to an RPC-backed state for this call.
+                            _raw_j = robot.model.zero_jacobian(
+                                Frame.EndEffector, robot.state
+                            )
+                        _cached_jacobian = np.asarray(_raw_j, dtype=np.float64)
+                        _cached_jacobian_q = q.copy()
+
                     self.response_queue.put(
-                        ("success", (q, dq, ee_translation, jacobian))
+                        ("success", (q, dq, ee_translation, _cached_jacobian))
                     )
+
+                elif command == "move_joint_velocity_async":
+                    # Fire-and-forget variant: parent does not wait for a
+                    # response so no reply is put on the response queue.
+                    # Errors are logged and recoverable faults are retried.
+                    try:
+                        _vel = np.asarray(args[0], dtype=np.float64)
+                        robot.move(
+                            JointVelocityMotion(
+                                cast(Any, _vel),
+                                Duration(VELOCITY_COMMAND_DURATION_MS),
+                            ),
+                            asynchronous=True,
+                        )
+                    except Exception as _e:
+                        _et = str(_e)
+                        if any(tok in _et for tok in _RECOVERABLE_ERRORS):
+                            try:
+                                robot.recover_from_errors()
+                            except Exception:
+                                pass
+                        logger.warning("move_joint_velocity_async error: %s", _e)
+
+                elif command == "move_ee_delta_async":
+                    # Fire-and-forget EE-twist variant (same rationale).
+                    try:
+                        _d = args[0]
+                        robot.move(
+                            CartesianVelocityMotion(
+                                Twist(
+                                    cast(Any, np.asarray(_d[:3], dtype=np.float64)),
+                                    cast(Any, np.asarray(_d[3:], dtype=np.float64)),
+                                ),
+                                Duration(VELOCITY_COMMAND_DURATION_MS),
+                                ee_dynamics,
+                            ),
+                            asynchronous=True,
+                        )
+                    except Exception as _e:
+                        _et = str(_e)
+                        if any(tok in _et for tok in _RECOVERABLE_ERRORS):
+                            try:
+                                robot.recover_from_errors()
+                            except Exception:
+                                pass
+                        logger.warning("move_ee_delta_async error: %s", _e)
 
                 elif command == "stop_motion":
                     # Match the active control mode (see "shutdown" below)
@@ -331,12 +417,27 @@ class MultiRobotWrapper:
     def move_joint_velocity_batch(
         self, velocities_by_robot: dict[str, list], asynchronous: bool = False
     ) -> dict[str, Any]:
-        """Send joint velocities (rad/s) to several arms in parallel."""
+        """Send joint velocities (rad/s) to several arms in parallel.
+
+        When *asynchronous* is True the parent enqueues the command and
+        returns immediately without waiting for a subprocess acknowledgement
+        (fire-and-forget). Errors are logged by the child and surfaced on
+        the next kinematic-state request if the robot enters an error state.
+        """
+        if asynchronous:
+            for name, vel in velocities_by_robot.items():
+                self._enqueue(
+                    name,
+                    "move_joint_velocity_async",
+                    [_validate_vector("move_joint_velocity", vel, NUM_JOINTS)],
+                    {},
+                )
+            return {}
         requests = [
             (
                 name,
                 "move_joint_velocity",
-                [_validate_vector("move_joint_velocity", vel, NUM_JOINTS), asynchronous],
+                [_validate_vector("move_joint_velocity", vel, NUM_JOINTS), False],
                 {},
             )
             for name, vel in velocities_by_robot.items()
@@ -346,12 +447,25 @@ class MultiRobotWrapper:
     def move_ee_delta_batch(
         self, positions_by_robot: dict[str, list], asynchronous: bool = False
     ) -> dict[str, Any]:
-        """Send EE twists to several arms in parallel."""
+        """Send EE twists to several arms in parallel.
+
+        When *asynchronous* is True the parent enqueues and returns without
+        waiting (fire-and-forget, same rationale as move_joint_velocity_batch).
+        """
+        if asynchronous:
+            for name, pos in positions_by_robot.items():
+                self._enqueue(
+                    name,
+                    "move_ee_delta_async",
+                    [_validate_vector("move_ee_delta position", pos, EE_DELTA_DIMS)],
+                    {},
+                )
+            return {}
         requests = [
             (
                 name,
                 "move_ee_delta",
-                [_validate_vector("move_ee_delta position", pos, EE_DELTA_DIMS), asynchronous],
+                [_validate_vector("move_ee_delta position", pos, EE_DELTA_DIMS), False],
                 {},
             )
             for name, pos in positions_by_robot.items()

@@ -331,7 +331,6 @@ class WSG:
 
     @classmethod
     def _move_cmd(cls, target_mm: float) -> bytes:
-        print("moeving to", target_mm)
         return f"MOVE({target_mm:.2f},{cls.MOVE_SPEED_MM_S:.1f})\n".encode()
 
     def _send_raw(self, data: bytes) -> bool:
