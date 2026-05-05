@@ -7,6 +7,7 @@ gathers their responses.
 """
 
 import logging
+import threading
 from multiprocessing import Process, Queue
 from queue import Empty
 from typing import Any, cast
@@ -30,7 +31,7 @@ VELOCITY_COMMAND_DURATION_MS = 500
 # (2 rad/s) and 20 Hz the worst-case staleness is one cycle (0.10 rad).
 # Safety analysis: ||ΔJ_row2|| ≈ 0.10 × 0.1 → v_z error ≈ 0.02 m/s,
 # well inside the 3 cm WORKTABLE_DISTANCE_MIN safety buffer.
-_JACOBIAN_CACHE_Q_THRESHOLD = 0.10  # rad; L-inf norm
+_JACOBIAN_CACHE_Q_THRESHOLD = 0.50  # rad; L-inf norm
 JOINT_RELATIVE_DYNAMICS = (1.0, 0.25, 1.0)
 TORQUE_THRESHOLD = 100.0 # Nm
 FORCE_THRESHOLD = 200.0 # N
@@ -233,50 +234,54 @@ class RobotProcess:
                     )
 
                 elif command == "move_joint_velocity_async":
-                    # Fire-and-forget variant: parent does not wait for a
-                    # response so no reply is put on the response queue.
-                    # Errors are logged and recoverable faults are retried.
-                    try:
-                        _vel = np.asarray(args[0], dtype=np.float64)
-                        robot.move(
-                            JointVelocityMotion(
-                                cast(Any, _vel),
-                                Duration(VELOCITY_COMMAND_DURATION_MS),
-                            ),
-                            asynchronous=True,
-                        )
-                    except Exception as _e:
-                        _et = str(_e)
-                        if any(tok in _et for tok in _RECOVERABLE_ERRORS):
-                            try:
-                                robot.recover_from_errors()
-                            except Exception:
-                                pass
-                        logger.warning("move_joint_velocity_async error: %s", _e)
+                    # Dispatch in a daemon thread so this command loop is not
+                    # blocked for the full RPyC round-trip of robot.move().
+                    # The next current_kinematic_state command is therefore
+                    # processed immediately without queuing behind the move.
+                    _vel = np.asarray(args[0], dtype=np.float64)
+                    _motion = JointVelocityMotion(
+                        cast(Any, _vel), Duration(VELOCITY_COMMAND_DURATION_MS)
+                    )
+
+                    def _run_jv(_m=_motion):
+                        try:
+                            robot.move(_m, asynchronous=True)
+                        except Exception as _e:
+                            _et = str(_e)
+                            if any(tok in _et for tok in _RECOVERABLE_ERRORS):
+                                try:
+                                    robot.recover_from_errors()
+                                except Exception:
+                                    pass
+                            logger.warning("move_joint_velocity_async error: %s", _e)
+
+                    threading.Thread(target=_run_jv, daemon=True).start()
 
                 elif command == "move_ee_delta_async":
-                    # Fire-and-forget EE-twist variant (same rationale).
-                    try:
-                        _d = args[0]
-                        robot.move(
-                            CartesianVelocityMotion(
-                                Twist(
-                                    cast(Any, np.asarray(_d[:3], dtype=np.float64)),
-                                    cast(Any, np.asarray(_d[3:], dtype=np.float64)),
-                                ),
-                                Duration(VELOCITY_COMMAND_DURATION_MS),
-                                ee_dynamics,
-                            ),
-                            asynchronous=True,
-                        )
-                    except Exception as _e:
-                        _et = str(_e)
-                        if any(tok in _et for tok in _RECOVERABLE_ERRORS):
-                            try:
-                                robot.recover_from_errors()
-                            except Exception:
-                                pass
-                        logger.warning("move_ee_delta_async error: %s", _e)
+                    # Same rationale: dispatch in a daemon thread.
+                    _d = args[0]
+                    _motion = CartesianVelocityMotion(
+                        Twist(
+                            cast(Any, np.asarray(_d[:3], dtype=np.float64)),
+                            cast(Any, np.asarray(_d[3:], dtype=np.float64)),
+                        ),
+                        Duration(VELOCITY_COMMAND_DURATION_MS),
+                        ee_dynamics,
+                    )
+
+                    def _run_ee(_m=_motion):
+                        try:
+                            robot.move(_m, asynchronous=True)
+                        except Exception as _e:
+                            _et = str(_e)
+                            if any(tok in _et for tok in _RECOVERABLE_ERRORS):
+                                try:
+                                    robot.recover_from_errors()
+                                except Exception:
+                                    pass
+                            logger.warning("move_ee_delta_async error: %s", _e)
+
+                    threading.Thread(target=_run_ee, daemon=True).start()
 
                 elif command == "stop_motion":
                     # Match the active control mode (see "shutdown" below)

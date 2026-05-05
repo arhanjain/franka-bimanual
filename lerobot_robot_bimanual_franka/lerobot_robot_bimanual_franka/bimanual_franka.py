@@ -7,7 +7,7 @@ MultiRobotWrapper; grippers communicate over TCP through WSG.
 
 import logging
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property
 
 import numpy as np
@@ -40,7 +40,7 @@ _CAMERA_READ_TIMEOUT_MS: float = 5.0
 # Joint-velocity PD controller for tracking joint-position targets. Lives in
 # the parent process (this file) rather than franka_process so the safety
 # screen can inspect/modify the same velocities that get streamed to franky.
-JOINT_PD_KP = 2.5
+JOINT_PD_KP = 2.0
 JOINT_PD_KD = 0.1
 
 # Per-arm action/observation feature key suffixes.
@@ -83,21 +83,13 @@ class BimanualFranka(Robot):
         }
         self.safety = ActionSafetyScreen()
 
-        # Cache populated by `get_observation` and consumed by the very next
-        # `send_action` to avoid issuing a redundant `current_kinematic_state`
-        # IPC every loop. Cleared after a single use so a stand-alone
-        # `send_action` still fetches a fresh snapshot.
+        # Snapshot populated by get_observation and consumed by the immediately
+        # following send_action so the same IPC round-trip serves both.
         self._cached_kin_state: dict[str, KinematicSnapshot] | None = None
 
-        # Thread pool for parallel camera async_read() calls.  One worker per
-        # camera so every grab runs concurrently with the kin-state IPC.
+        # One worker per camera so all grabs run concurrently with the
+        # kin-state IPC in get_observation.
         self._camera_pool = ThreadPoolExecutor(max_workers=max(len(self.cameras), 1))
-
-        # Single-worker pool for the kin-state prefetch that runs between
-        # send_action and the next get_observation (overlapping policy exec).
-        # Kept separate from _camera_pool so prefetch never starves cameras.
-        self._prefetch_pool = ThreadPoolExecutor(max_workers=1)
-        self._prefetch_future: "Future[dict[str, KinematicSnapshot]] | None" = None
 
     def _gripper_ip(self, arm: str) -> str:
         return getattr(self.config, f"{arm}_gripper_ip")
@@ -211,11 +203,8 @@ class BimanualFranka(Robot):
         )
 
     def disconnect(self) -> None:
-        # Shut down thread pools before the child processes exit so the
-        # prefetch thread does not block indefinitely in queue.get().
         self._camera_pool.shutdown(wait=False)
-        self._prefetch_pool.shutdown(wait=False)
-        self._prefetch_future = None
+        self._cached_kin_state = None
         for camera in self.cameras.values():
             camera.disconnect()
         self.robot_manager.shutdown()
@@ -237,64 +226,30 @@ class BimanualFranka(Robot):
     # ------------------------------------------------------------------
 
     def _fetch_kin_state(self) -> dict[str, KinematicSnapshot]:
-        """One parallel IPC round-trip to grab (q, dq, ee, J) for every arm."""
+        """One parallel IPC round-trip to grab (q, dq, ee, J) for every arm.
+
+        With move_*_async dispatched in daemon threads inside each child
+        process, this call is no longer serialised behind robot.move() and
+        returns in ~2 ms (callback data + cached Jacobian).
+        """
         return self.robot_manager.current_kinematic_state_batch(
             list(self.active_arms)
         )
-
-    def _drain_prefetch(self) -> "dict[str, KinematicSnapshot] | None":
-        """Return and consume the result of an in-flight prefetch, or None.
-
-        Returning None (on error or no prefetch) signals that the caller
-        should fall back to a fresh _fetch_kin_state() call.  Any exception
-        raised by the prefetch is logged but not re-raised so the control
-        loop can recover transparently.
-        """
-        fut = self._prefetch_future
-        self._prefetch_future = None
-        if fut is None:
-            return None
-        try:
-            return fut.result()
-        except Exception as exc:
-            logger.warning("Kin-state prefetch failed, falling back to fresh fetch: %s", exc)
-            return None
-
-    def _consume_kin_state(self) -> dict[str, KinematicSnapshot]:
-        """Return the cached snapshot if fresh, otherwise fetch one.
-
-        If a prefetch is in flight (started by the previous send_action),
-        it is drained here before falling back to the cache or a live fetch.
-        This prevents orphaned responses from accumulating in the child's
-        response_queue when send_action is called without a prior
-        get_observation.
-        """
-        prefetched = self._drain_prefetch()
-        if prefetched is not None:
-            return prefetched
-        kin_state = self._cached_kin_state
-        self._cached_kin_state = None
-        return kin_state if kin_state is not None else self._fetch_kin_state()
 
     def get_observation(self) -> RobotObservation:
         if not self.is_connected:
             raise ConnectionError(f"{self} is not connected.")
 
-        # Submit all camera grabs immediately so they run in parallel with
-        # the kin-state IPC round-trip rather than after it.  The short
-        # timeout makes each read return a cached frame (stale by at most
-        # one cycle) when no fresh frame is ready, keeping the cameras from
-        # becoming the rate-limiting step in the control loop.
+        # Submit camera grabs immediately so they overlap the kin-state IPC.
+        # The short timeout returns a cached (stale-by-one-cycle) frame when
+        # no fresh frame is available, preventing cameras from becoming the
+        # rate-limiting step.
         camera_futures = {
             name: self._camera_pool.submit(camera.async_read, _CAMERA_READ_TIMEOUT_MS)
             for name, camera in self.cameras.items()
         }
 
-        # Use the prefetch result if it is ready (started by the previous
-        # send_action while the policy was executing), otherwise block on a
-        # fresh fetch.  Either way, camera reads overlap this wait.
-        prefetched = self._drain_prefetch()
-        kin_state = prefetched if prefetched is not None else self._fetch_kin_state()
+        kin_state = self._fetch_kin_state()
         self._cached_kin_state = kin_state
 
         obs: RobotObservation = {}
@@ -307,7 +262,7 @@ class BimanualFranka(Robot):
         for camera_name, fut in camera_futures.items():
             try:
                 obs[camera_name] = fut.result()
-            except Exception as exc:  # noqa: BLE001 - preserve control-path behavior
+            except Exception as exc:  # noqa: BLE001
                 logger.warning("Camera %s read failed: %s", camera_name, exc)
                 obs[camera_name] = self.cameras[camera_name].blank_frame()
 
@@ -316,20 +271,21 @@ class BimanualFranka(Robot):
     def send_action(self, action: RobotAction) -> RobotAction:
         """Forward gripper + arm commands.
 
-        One IPC round-trip fetches the kinematic snapshot used by both the PD
-        controller and the safety screen (or reuses the snapshot stashed by
-        the immediately preceding `get_observation`). A second parallel IPC
-        ships the velocity command to both arm subprocesses. Gripper sends
-        are non-blocking and run in parallel with the arm IPC.
-
-        After the motion command is dispatched a kin-state prefetch is
-        kicked off in the background so the next get_observation can reuse
-        the result instead of waiting for a full IPC round-trip.
+        Reuses the kinematic snapshot stashed by the immediately preceding
+        get_observation (avoiding a redundant IPC round-trip), or fetches a
+        fresh one if send_action is called stand-alone. Gripper moves are
+        non-blocking. Arm motion is fire-and-forget: each child dispatches
+        robot.move() in a daemon thread so its command queue never blocks on
+        the ~90 ms RPyC round-trip, letting the next get_observation's
+        _fetch_kin_state() return immediately.
         """
         for arm in self.active_arms:
             self.grippers[arm].move(action[f"{arm}_gripper"], blocking=False)
 
-        kin_state = self._consume_kin_state()
+        kin_state = self._cached_kin_state
+        self._cached_kin_state = None
+        if kin_state is None:
+            kin_state = self._fetch_kin_state()
 
         if self.use_ee_delta:
             twists = {
@@ -346,8 +302,6 @@ class BimanualFranka(Robot):
                 asynchronous=True,
             )
         else:
-            # Joint mode: PD turns each position target into a velocity, then the
-            # safety screen + magnitude clamp shape it before it goes out.
             velocities = {
                 arm: self._joint_pd(action, arm, kin_state[arm])
                 for arm in self.active_arms
@@ -357,11 +311,6 @@ class BimanualFranka(Robot):
                 {arm: vel.tolist() for arm, vel in velocities.items()},
                 asynchronous=True,
             )
-
-        # Start the next kin-state fetch while the caller's policy runs so
-        # get_observation finds the result ready (or nearly so) next cycle.
-        if self._prefetch_future is None:
-            self._prefetch_future = self._prefetch_pool.submit(self._fetch_kin_state)
 
         return action
 
