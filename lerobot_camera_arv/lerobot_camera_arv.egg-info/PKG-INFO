@@ -3,3 +3,6 @@ Name: lerobot_camera_arv
 Version: 0.0.0
 Summary: Aravis camera plugin for LeRobot
 Requires-Python: >=3.10
+Requires-Dist: lerobot
+Requires-Dist: PyGObject<3.52
+Requires-Dist: opencv-python-headless

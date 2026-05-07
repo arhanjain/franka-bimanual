@@ -7,6 +7,11 @@ name = "lerobot_camera_arv"
 version = "0.0.0"
 description = "Aravis camera plugin for LeRobot"
 requires-python = ">=3.10"
+dependencies = [
+    "lerobot",
+    "PyGObject<3.52",
+    "opencv-python-headless",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -7,15 +7,6 @@
 # $4 is steps
 # $5 policy type
 
-if command -v conda >/dev/null 2>&1; then
-  CONDA_BASE="$(conda info --base 2>/dev/null || true)"
-  if [ -n "$CONDA_BASE" ] && [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
-    # shellcheck disable=SC1090
-    source "$CONDA_BASE/etc/profile.d/conda.sh"
-  fi
-  conda activate lerobot >/dev/null 2>&1 || true
-fi
-
 if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ] || [ -z "$5" ]; then
     echo "Usage: $0 <repo_id> <policy_repo_id> <batch_size> <steps>"
     exit 1

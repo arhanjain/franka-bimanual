@@ -7,6 +7,12 @@ name = "lerobot_camera_framos"
 version = "0.0.0"
 description = "FRAMOS D400e (RealSense over Ethernet) camera plugin for LeRobot"
 requires-python = ">=3.10"
+dependencies = [
+    "lerobot",
+    "opencv-python-headless",
+    # pyrealsense2 must be installed from the FRAMOS SDK build, NOT from PyPI.
+    # Run: uv pip install --no-build-isolation ~/librealsense2/wrappers/python/
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

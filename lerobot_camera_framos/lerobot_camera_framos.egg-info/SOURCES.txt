@@ -5,4 +5,5 @@ lerobot_camera_framos/framos.py
 lerobot_camera_framos.egg-info/PKG-INFO
 lerobot_camera_framos.egg-info/SOURCES.txt
 lerobot_camera_framos.egg-info/dependency_links.txt
+lerobot_camera_framos.egg-info/requires.txt
 lerobot_camera_framos.egg-info/top_level.txt

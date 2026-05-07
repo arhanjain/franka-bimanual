@@ -3,3 +3,5 @@ Name: lerobot_camera_framos
 Version: 0.0.0
 Summary: FRAMOS D400e (RealSense over Ethernet) camera plugin for LeRobot
 Requires-Python: >=3.10
+Requires-Dist: lerobot
+Requires-Dist: opencv-python-headless
