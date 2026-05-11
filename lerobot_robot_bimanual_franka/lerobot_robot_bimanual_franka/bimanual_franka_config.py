@@ -23,12 +23,12 @@ class BimanualFrankaConfig(RobotConfig):
     active_arms: tuple[str, ...] = _VALID_ARMS
     cameras: dict[str, CameraConfig] = field(
         default_factory=lambda: {
-            "cam_1": ArvCameraConfig(name="gripper_bfs_23595723", ip="192.168.0.142", fps=15, width=224, height=224),
-            "cam_2": FramosCameraConfig(name="workspace_framos_d71", ip="192.168.0.116", serial_number="6CD146030D71", fps=15, width=224, height=224),
-            "cam_3": ArvCameraConfig(name="gripper_bfs_23595719", ip="192.168.1.138", fps=15, width=224, height=224),
-            "cam_4": ArvCameraConfig(name="gripper_bfs_23595720", ip="192.168.1.139", fps=15, width=224, height=224),
-            "cam_5": ArvCameraConfig(name="gripper_bfs_23595724", ip="192.168.1.143", fps=15, width=224, height=224),
-            "cam_6": FramosCameraConfig(name="workspace_framos_d63", ip="192.168.1.102", serial_number="6CD146030D63", fps=15, width=224, height=224),
+            "cam_1": ArvCameraConfig(name="gripper_bfs_23595723", ip="192.168.0.142", fps=30, width=224, height=224),
+            "cam_2": FramosCameraConfig(name="workspace_framos_d71", ip="192.168.0.116", serial_number="6CD146030D71", fps=30, width=224, height=224),
+            "cam_3": ArvCameraConfig(name="gripper_bfs_23595719", ip="192.168.1.138", fps=30, width=224, height=224),
+            "cam_4": ArvCameraConfig(name="gripper_bfs_23595720", ip="192.168.1.139", fps=30, width=224, height=224),
+            "cam_5": ArvCameraConfig(name="gripper_bfs_23595724", ip="192.168.1.143", fps=30, width=224, height=224),
+            "cam_6": FramosCameraConfig(name="workspace_framos_d63", ip="192.168.1.102", serial_number="6CD146030D63", fps=30, width=224, height=224),
         }
     )
 

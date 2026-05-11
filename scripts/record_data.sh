@@ -35,7 +35,7 @@ lerobot-record \
     --dataset.root="$4" \
     --dataset.streaming_encoding=true \
     --dataset.vcodec=auto \
-    --dataset.fps=15 \
+    --dataset.fps=30 \
     --display_data=false \
     --display_compressed_images=true \
     --teleop.id=gello_teleop \

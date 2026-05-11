@@ -23,4 +23,4 @@ lerobot-teleoperate \
     --teleop.id=spacemouse_teleop \
     --teleop.left_arm_config.hidraw_path=/dev/hidraw2 \
     --teleop.right_arm_config.hidraw_path=/dev/hidraw3 \
-    --fps=15
+    --fps=30

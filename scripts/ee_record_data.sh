@@ -14,7 +14,7 @@ if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ] || [ -z "$5" ]; then
     exit 1
 fi
 lerobot-record \
-    --resume=$5\
+    --resume=$5 \
     --robot.type=bimanual_franka \
     --robot.l_server_ip=192.168.3.11 \
     --robot.l_robot_ip=192.168.200.2 \
@@ -32,7 +32,7 @@ lerobot-record \
     --dataset.root="$4" \
     --dataset.streaming_encoding=true \
     --dataset.vcodec=auto \
-    --dataset.fps=15 \
+    --dataset.fps=30 \
     --display_data=false \
     --display_compressed_images=true \
     --teleop.id=gello_ee_teleop \
