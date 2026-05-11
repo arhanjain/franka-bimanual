@@ -35,7 +35,6 @@ JOINT_FEATURE_KEYS: tuple[str, ...] = (*(f"joint_{i}" for i in range(1, NUM_JOIN
 EE_FEATURE_KEYS: tuple[str, ...] = ("x", "y", "z", "qx", "qy", "qz", "qw", "gripper")
 EE_AXIS_KEYS: tuple[str, ...] = ("x", "y", "z", "qx", "qy", "qz", "qw")
 
-_PROCESS_STARTUP_S = 1.0
 _CONNECT_RETRIES = 3
 _CONNECT_TIMEOUT_S = 10.0
 _RETRY_SLEEP_S = 1.0
@@ -61,7 +60,7 @@ class BimanualFranka(Robot):
             for arm in self.active_arms
         }
         self.safety = ActionSafetyScreen()
-        # Populated by get_observation; consumed by the next send_action to avoid a redundant IPC round-trip.
+        # Populated by get_observation; consumed by the next send_action to avoid a redundant RPyC round-trip.
         self._cached_kin_state: dict[str, KinematicSnapshot] | None = None
         self._camera_pool = ThreadPoolExecutor(max_workers=max(len(self.cameras), 1))
 
@@ -122,7 +121,6 @@ class BimanualFranka(Robot):
                     self._port(arm),
                     use_ee_delta=self.use_ee_pos,
                 )
-            time.sleep(_PROCESS_STARTUP_S)
             for arm in self.active_arms:
                 self._probe_arm(arm)
             for arm in self.active_arms:
@@ -174,7 +172,7 @@ class BimanualFranka(Robot):
         if not self.is_connected:
             raise ConnectionError(f"{self} is not connected.")
 
-        # Submit camera reads immediately so they overlap the IPC round-trip below.
+        # Submit camera reads immediately so they overlap the RPyC round-trips below.
         camera_futures = {
             name: self._camera_pool.submit(camera.async_read, _CAMERA_READ_TIMEOUT_MS)
             for name, camera in self.cameras.items()
