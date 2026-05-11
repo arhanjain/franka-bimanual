@@ -1,19 +1,28 @@
-"""3Dconnexion SpaceMouse teleoperator for EE-delta robot control.
+"""3Dconnexion SpaceMouse teleoperator for absolute EE-pose robot control.
 
 Thin wrapper around `pyspacemouse` that exposes the device as a LeRobot
-:class:`Teleoperator`. Each call to :pymeth:`get_action` returns:
+:class:`Teleoperator`. Each call to :pymeth:`get_action` integrates the
+device twist into a running absolute EE pose and returns:
 
-- linear and angular twist components (m/s, rad/s) scaled from the device
-  axes (already normalized to [-1, 1] by pyspacemouse);
-- a ``gripper`` target in millimeters, latched from the two device buttons:
+- absolute Cartesian position (x, y, z) in metres, updated by the device's
+  linear axes (already normalized to [-1, 1] by pyspacemouse);
+- absolute orientation as a unit quaternion (qx, qy, qz, qw), updated by
+  composing a small-angle rotation from the device's angular axes onto the
+  current orientation;
+- a ``gripper`` target normalised to ``[0, 1]`` (0 = fully closed,
+  1 = ``gripper_norm_max_mm``), latched from the two device buttons:
   left button = close (drive to ``gripper_min_mm``), right button = open
   (drive to ``gripper_max_mm``).
+
+Call :pymeth:`seed_state` before starting teleop to initialise the integrated
+pose from the robot arm's actual EE state.
 """
 
 import logging
 
 import pyspacemouse
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from lerobot.teleoperators import Teleoperator
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
@@ -30,13 +39,11 @@ _MAX_DRAIN_PER_TICK = 64
 
 
 class SpaceMouse(Teleoperator):
-    """3Dconnexion SpaceMouse leader producing EE-delta twists and a latched gripper target."""
+    """3Dconnexion SpaceMouse leader producing an absolute EE pose and a latched gripper target."""
 
     config_class = SpaceMouseConfig
     name = "spacemouse"
 
-    # Order matches the EE-delta convention used by the bimanual Franka
-    # (linear xyz, angular roll/pitch/yaw).
     AXIS_NAMES = ("x", "y", "z", "qx", "qy", "qz", "qw")
 
     def __init__(self, config: SpaceMouseConfig):
@@ -52,8 +59,26 @@ class SpaceMouse(Teleoperator):
         self._device: pyspacemouse.SpaceMouseDevice | None = None
         self._gripper_target_mm: float = float(config.initial_gripper_mm)
 
-        self.cur_pos: np.ndarray = np.asarray([0.5, 0.0, 0.5], dtype=np.float64)
-        self.cur_rot: np.ndarray = np.asarray([0.94045083, -0.32899504, 0.08059487, -0.02861769], dtype=np.float64)
+        self.cur_pos: np.ndarray = np.asarray(config.initial_pos, dtype=np.float64)
+        self.cur_rot: Rotation = Rotation.from_quat(config.initial_rot)  # stored as xyzw
+
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
+
+    def seed_state(self, pos: np.ndarray, rot_xyzw: np.ndarray) -> None:
+        """Initialise the integrated EE pose from the robot's live state.
+
+        Call this once after connecting (and before the first :pymeth:`get_action`)
+        so the spacemouse starts tracking from the arm's true EE position rather
+        than ``config.initial_pos`` / ``config.initial_rot``.
+
+        Args:
+            pos: EE Cartesian position ``[x, y, z]`` in metres.
+            rot_xyzw: EE orientation as a unit quaternion ``[qx, qy, qz, qw]``.
+        """
+        self.cur_pos = np.asarray(pos, dtype=np.float64).copy()
+        self.cur_rot = Rotation.from_quat(rot_xyzw)
 
     # ------------------------------------------------------------------
     # Teleoperator interface
@@ -138,15 +163,33 @@ class SpaceMouse(Teleoperator):
         r_scale = self.config.rotation_scale
         tx, ty, tz = self.config.translation_signs
         rx, ry, rz = self.config.rotation_signs
+
+        # Integrate position: spacemouse x/y are swapped relative to robot frame.
+        self.cur_pos = self.cur_pos + np.array([
+            state.y * t_scale * tx,
+            state.x * t_scale * ty,
+            state.z * t_scale * tz,
+        ], dtype=np.float64)
+
+        # Integrate orientation: compose a small-angle rotation onto cur_rot.
+        # Rotation.from_euler interprets the angles as intrinsic xyz (roll/pitch/yaw).
+        delta_rot = Rotation.from_euler("xyz", [
+            state.roll  * r_scale * rx,
+            state.pitch * r_scale * ry,
+            state.yaw   * r_scale * rz,
+        ])
+        self.cur_rot = delta_rot * self.cur_rot
+
+        qx, qy, qz, qw = self.cur_rot.as_quat()  # scipy returns xyzw
         return {
-            "x": state.y * t_scale * tx,
-            "y": state.x * t_scale * ty,
-            "z": state.z * t_scale * tz,
-            "qx": state.roll * r_scale * rx,
-            "qy": state.pitch * r_scale * ry,
-            "qz": state.yaw * r_scale * rz,
-            "qw": state.yaw * r_scale * rz,
-            "gripper": self._gripper_target_mm,
+            "x":  float(self.cur_pos[0]),
+            "y":  float(self.cur_pos[1]),
+            "z":  float(self.cur_pos[2]),
+            "qx": float(qx),
+            "qy": float(qy),
+            "qz": float(qz),
+            "qw": float(qw),
+            "gripper": self._gripper_target_mm
         }
 
     def send_feedback(self, feedback: dict[str, float]) -> None:

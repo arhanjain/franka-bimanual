@@ -1,42 +1,53 @@
-"""Configuration dataclass for the SpaceMouse teleoperator plugin.
+"""Configuration dataclasses for the SpaceMouse teleoperator plugin.
 
-Defines the hidraw device path, axis scaling and signs, and gripper travel
-limits used by :class:`SpaceMouse`.
+``SpaceMouseLeaderFields`` is a plain dataclass holding the per-device
+hardware parameters.  It can be embedded inside ``BimanualSpaceMouseConfig``
+without draccus recursing through the TeleoperatorConfig choice registry.
+
+``SpaceMouseConfig`` composes the standard ``TeleoperatorConfig`` metadata
+with ``SpaceMouseLeaderFields`` for the single-arm case.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from lerobot.teleoperators.config import TeleoperatorConfig
 
 
-@TeleoperatorConfig.register_subclass("spacemouse")
 @dataclass
-class SpaceMouseConfig(TeleoperatorConfig):
-    # Path to the hidraw node for the SpaceMouse. Two SpaceMice plugged in
-    # at the same time appear as separate /dev/hidrawN nodes.
+class SpaceMouseLeaderFields:
+    """Hardware parameters for one SpaceMouse device."""
+
+    # Path to the hidraw node. Two SpaceMice appear as separate /dev/hidrawN.
     hidraw_path: str = "/dev/hidraw4"
 
-    # Linear velocity (m/s) at full axis deflection. pyspacemouse already
-    # normalizes axis values to [-1, 1], so this is the achievable peak.
-    translation_scale: float = 0.15
-    # Angular velocity (rad/s) at full axis deflection.
-    rotation_scale: float = 0.6
+    # Position increment (metres) per control tick at full axis deflection.
+    # pyspacemouse normalises axis values to [-1, 1].
+    translation_scale: float = 0.035
+    # Rotation increment (radians) per control tick at full axis deflection.
+    rotation_scale: float = 0.25
 
-    # Per-axis sign multipliers applied to the SpaceMouse output before
-    # scaling. Each entry must be +1 or -1. Use these to flip an axis
-    # whose physical orientation does not match the robot's base frame
-    # convention. Order is (x, y, z) for translation and (roll, pitch,
-    # yaw) for rotation, matching SpaceMouse.AXIS_NAMES.
-    translation_signs: tuple[int, int, int] = (1, -1, 1)
-    rotation_signs: tuple[int, int, int] = (1, 1, -1)
+    # Initial EE Cartesian position [x, y, z] in metres. Override with
+    # SpaceMouse.seed_state() to sync to the arm's actual EE on startup.
+    initial_pos: tuple[float, float, float] = field(default_factory=lambda: (0.5, 0.0, 0.5))
+    # Initial EE orientation as a unit quaternion [qx, qy, qz, qw].
+    initial_rot: tuple[float, float, float, float] = field(default_factory=lambda: (1.0, 0.0, 0.0, 0.0))
 
-    # Gripper travel limits forwarded as the action's "gripper" value (mm).
-    # The right button drives the target to gripper_max_mm (open); the left
-    # button drives it to gripper_min_mm (close).
-    gripper_min_mm: float = 20.0
-    gripper_max_mm: float = 100.0
+    # Per-axis sign multipliers (+1 or -1) to match the robot's base frame.
+    # Order: (x, y, z) for translation and (roll, pitch, yaw) for rotation.
+    translation_signs: tuple[int, int, int] = field(default_factory=lambda: (1, -1, 1))
+    rotation_signs: tuple[int, int, int] = field(default_factory=lambda: (1, 1, -1))
+
+    # Gripper travel limits (mm). Right button → open, left button → close.
+    gripper_min_mm: float = 0.1
+    gripper_max_mm: float = 0.9
     # Gripper target on connect, before any button press.
-    initial_gripper_mm: float = 100.0
+    initial_gripper_mm: float = 0.9
+
+
+@TeleoperatorConfig.register_subclass("spacemouse")
+@dataclass
+class SpaceMouseConfig(TeleoperatorConfig, SpaceMouseLeaderFields):
+    """Single SpaceMouse leader, registered as the ``"spacemouse"`` teleoperator type."""
 
     def __post_init__(self) -> None:
         super_post_init = getattr(super(), "__post_init__", None)
