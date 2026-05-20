@@ -26,4 +26,6 @@ lerobot-teleoperate \
     --teleop.id=${MODE}_r_teleop \
     --teleop.side=r \
     --teleop.port=$PORT \
-    --fps=30
+    --fps=30 \
+    --display_data=true \
+    --display_compressed_images=true
