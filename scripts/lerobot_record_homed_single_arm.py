@@ -264,19 +264,19 @@ def main() -> None:
                     (recorded < args.num_episodes - 1) or events["rerecord_episode"]
                 ):
                     log_say("Reset the environment", args.play_sounds)
-                    # record_loop(
-                    #     robot=robot,
-                    #     events=events,
-                    #     fps=args.fps,
-                    #     teleop_action_processor=teleop_proc,
-                    #     robot_action_processor=robot_action_proc,
-                    #     robot_observation_processor=robot_obs_proc,
-                    #     teleop=teleop,
-                    #     control_time_s=args.reset_time_s,
-                    #     single_task=args.task,
-                    # )
-                    # sleep in between episdoes
-                    time.sleep(args.reset_time_s)
+                    record_loop(
+                        robot=robot,
+                        events=events,
+                        fps=args.fps,
+                        teleop_action_processor=teleop_proc,
+                        robot_action_processor=robot_action_proc,
+                        robot_observation_processor=robot_obs_proc,
+                        teleop=teleop,
+                        control_time_s=args.reset_time_s,
+                        single_task=args.task,
+                    )
+                    # sleep in between episodes
+                    # time.sleep(args.reset_time_s)
 
                 if events["rerecord_episode"]:
                     log_say("Re-record episode", args.play_sounds)
