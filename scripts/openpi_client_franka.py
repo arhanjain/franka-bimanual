@@ -192,6 +192,7 @@ class SingleFrankaRobot:
             self._server_ip,
             self._robot_ip,
             self._port,
+            False,
             use_ee_delta=False,
         )
         time.sleep(_PROCESS_STARTUP_S)

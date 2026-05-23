@@ -18,7 +18,7 @@ lerobot-teleoperate \
     --robot.type=single_arm_franka \
     --robot.r_server_ip=192.168.3.10 \
     --robot.r_robot_ip=192.168.201.10 \
-    --robot.r_gripper_ip=192.168.2.20 \
+    --robot.r_gripper_ip=192.168.201.10 \
     --robot.r_port=18812 \
     --robot.use_ee_pos=$USE_EE_POS \
     --robot.active_arms=[r] \
@@ -26,4 +26,4 @@ lerobot-teleoperate \
     --teleop.id=${MODE}_r_teleop \
     --teleop.side=r \
     --teleop.port=$PORT \
-    --fps=30
+    --fps=20

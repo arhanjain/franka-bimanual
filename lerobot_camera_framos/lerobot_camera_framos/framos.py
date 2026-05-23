@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 import pyrealsense2 as rs
 from numpy.typing import NDArray
+import open3d as o3d
 
 from lerobot.cameras.camera import Camera
 
@@ -252,6 +253,10 @@ class FramosCamera(Camera):
                 # points = pc.calculate(depth)
                 # vertices = np.asanyarray(points.get_vertices()).view(np.float32).reshape(-1, 3)
                 # print(len(vertices))
+                # pcd = o3d.geometry.PointCloud()
+                # pcd.points = o3d.utility.Vector3dVector(vertices)
+
+                # o3d.visualization.draw_geometries([pcd])
                 self._last_depth = np.asanyarray(depth.get_data())
 
             if not color:

@@ -47,7 +47,7 @@ from lerobot_teleoperator_gello import GelloConfig, GelloEEConfig
 logger = logging.getLogger(__name__)
 
 
-_R_SERVER_IP, _R_ROBOT_IP, _R_GRIPPER_IP, _R_PORT = "192.168.3.10", "192.168.201.10", "192.168.2.20", 18812
+_R_SERVER_IP, _R_ROBOT_IP, _R_GRIPPER_IP, _R_PORT = "192.168.3.10", "192.168.201.10", "192.168.201.10", 18812
 _R_GELLO_PORT = "/dev/ttyUSB0"
 
 
@@ -139,9 +139,9 @@ def main() -> None:
         help="Teleop type (ignored when --policy is set)",
     )
     p.add_argument("--teleop-id", default="homed_single_arm_teleop")
-    p.add_argument("--fps", type=int, default=30)
+    p.add_argument("--fps", type=int, default=20)
     p.add_argument("--episode-time-s", type=float, default=60.0)
-    p.add_argument("--reset-time-s", type=float, default=3.0, help="Time between episodes for manual reset")
+    p.add_argument("--reset-time-s", type=float, default=5.0, help="Time between episodes for manual reset")
     p.add_argument("--resume", type=_str2bool, default=False)
     p.add_argument("--push-to-hub", type=_str2bool, default=True)
     p.add_argument("--play-sounds", type=_str2bool, default=False)
@@ -264,19 +264,20 @@ def main() -> None:
                     (recorded < args.num_episodes - 1) or events["rerecord_episode"]
                 ):
                     log_say("Reset the environment", args.play_sounds)
-                    record_loop(
-                        robot=robot,
-                        events=events,
-                        fps=args.fps,
-                        teleop_action_processor=teleop_proc,
-                        robot_action_processor=robot_action_proc,
-                        robot_observation_processor=robot_obs_proc,
-                        teleop=teleop,
-                        control_time_s=args.reset_time_s,
-                        single_task=args.task,
-                    )
-                    # sleep in between episodes
-                    # time.sleep(args.reset_time_s)
+                    if args.policy is not None:
+                        record_loop(
+                            robot=robot,
+                            events=events,
+                            fps=args.fps,
+                            teleop_action_processor=teleop_proc,
+                            robot_action_processor=robot_action_proc,
+                            robot_observation_processor=robot_obs_proc,
+                            teleop=teleop,
+                            control_time_s=args.reset_time_s,
+                            single_task=args.task,
+                        )
+                    else:
+                        input("Press Enter when ready to start the next episode...")
 
                 if events["rerecord_episode"]:
                     log_say("Re-record episode", args.play_sounds)

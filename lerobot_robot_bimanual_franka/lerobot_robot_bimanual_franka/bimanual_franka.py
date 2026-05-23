@@ -14,6 +14,7 @@ from lerobot_camera_arv import ArvCamera, ArvCameraConfig
 from lerobot_camera_framos import FramosCamera, FramosCameraConfig
 
 from .bimanual_franka_config import BimanualFrankaConfig
+from .franka_gripper import FrankaGripper
 from .franka_fk import franka_fk
 from .franka_process import NUM_JOINTS, KinematicSnapshot, MultiRobotWrapper
 from .safety import ActionSafetyScreen
@@ -53,14 +54,25 @@ class BimanualFranka(Robot):
         self.active_arms = config.active_arms
         self.cameras: dict[str, Camera] = {n: _make_camera(c) for n, c in config.cameras.items()}
         self.robot_manager = MultiRobotWrapper()
-        self.grippers: dict[str, WSG] = {
-            arm: WSG(name=arm, TCP_IP=getattr(config, f"{arm}_gripper_ip"), do_print=False)
-            for arm in self.active_arms
+        self.grippers: dict[str, WSG | FrankaGripper] = {
+            arm: self._make_gripper(arm) for arm in self.active_arms
         }
         self.safety = ActionSafetyScreen()
         # Populated by get_observation, consumed by next send_action to skip a redundant RPyC round-trip.
         self._cached_kin_state: dict[str, KinematicSnapshot] | None = None
         self._camera_pool = ThreadPoolExecutor(max_workers=max(len(self.cameras), 1))
+
+    def _make_gripper(self, arm: str) -> WSG | FrankaGripper:
+        gripper_ip = getattr(self.config, f"{arm}_gripper_ip")
+        if gripper_ip == getattr(self.config, f"{arm}_robot_ip"):
+            return FrankaGripper(
+                name=arm,
+                server_ip=getattr(self.config, f"{arm}_server_ip"),
+                robot_ip=getattr(self.config, f"{arm}_robot_ip"),
+                port=getattr(self.config, f"{arm}_port"),
+                do_print=False,
+            )
+        return WSG(name=arm, TCP_IP=gripper_ip, do_print=False)
 
     def _arm_features(self, keys: tuple[str, ...]) -> dict[str, type]:
         return {f"{arm}_{key}": float for arm in self.active_arms for key in keys}
@@ -139,11 +151,13 @@ class BimanualFranka(Robot):
         self._cached_kin_state = kin
 
         obs: RobotObservation = {}
+
         for arm in self.active_arms:
             for i, qi in enumerate(kin[arm][0]):
                 obs[f"{arm}_joint_{i + 1}"] = float(qi)
             pos = self.grippers[arm].position
-            obs[f"{arm}_gripper"] = (0 if pos is None else pos) / WSG.GRIPPER_TRUE_MAX_MM
+            max_mm = self.grippers[arm].GRIPPER_TRUE_MAX_MM
+            obs[f"{arm}_gripper"] = (0 if pos is None else pos) / max_mm
 
         for n, fut in cam_futs.items():
             try:
@@ -159,7 +173,10 @@ class BimanualFranka(Robot):
         self._cached_kin_state = None
 
         for arm in self.active_arms:
-            self.grippers[arm].move(np.clip(action[f"{arm}_gripper"], 0.0, 1.0) * WSG.GRIPPER_TRUE_MAX_MM, blocking=False)
+            self.grippers[arm].move(
+                np.clip(action[f"{arm}_gripper"], 0.0, 1.0) * self.grippers[arm].GRIPPER_TRUE_MAX_MM,
+                blocking=False,
+            )
 
         if self.use_ee_pos:
             cmds = self.safety.shape_ee(
@@ -208,9 +225,9 @@ class BimanualFranka(Robot):
         }
         if not targets_q:
             return True
-
+            
         for arm in targets_q:
-            self.grippers[arm].move(gripper_norm * WSG.GRIPPER_TRUE_MAX_MM, blocking=False)
+            self.grippers[arm].move(gripper_norm * self.grippers[arm].GRIPPER_TRUE_MAX_MM, blocking=False)
 
         rate_hz = float(
             home_fps
