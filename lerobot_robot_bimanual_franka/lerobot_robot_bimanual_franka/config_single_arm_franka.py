@@ -18,7 +18,7 @@ class SingleArmFrankaConfig(RobotConfig):
     depth: bool = True
     depth_cam: str = "cam_2_scene"
     world_in_robot_translation_m: tuple[float, float, float] = (0.669, 0.003, 0.120)
-    world_in_robot_quat_wxyz: tuple[float, float, float, float] = (0.00910219, 0.01744575, 0.3739584, 0.92723671)
+    world_in_robot_quat_wxyz: tuple[float, float, float, float] = (0.926393, 0.0, 0.0, -0.376557)
     depth_crop_radius_m: float = 0.4
     cameras: dict[str, CameraConfig] = field(
         default_factory=lambda: {

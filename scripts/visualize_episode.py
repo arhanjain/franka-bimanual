@@ -18,11 +18,18 @@ import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 import torch
+from scipy.spatial.transform import Rotation
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 from lerobot_robot_bimanual_franka import BimanualFrankaConfig
 from lerobot_teleoperator_gello.franka_fk import franka_fk_chain
+
+_WORLD_IN_ROBOT_TRANSLATION_M = np.array((0.669, 0.003, 0.120), dtype=np.float64)
+_WORLD_IN_ROBOT_QUAT_WXYZ = np.array((0.926393, 0.0, 0.0, -0.376557), dtype=np.float64)
+_WORLD_FROM_ROBOT_ROT = Rotation.from_quat(
+    (_WORLD_IN_ROBOT_QUAT_WXYZ[1], _WORLD_IN_ROBOT_QUAT_WXYZ[2], _WORLD_IN_ROBOT_QUAT_WXYZ[3], _WORLD_IN_ROBOT_QUAT_WXYZ[0])
+).inv()
 
 
 def _camera_names() -> dict[str, str]:
@@ -57,6 +64,16 @@ def _action_mode(action_names: Sequence[str]) -> str:
     return "joint"
 
 
+def _robot_to_world_points(points: np.ndarray) -> np.ndarray:
+    return _WORLD_FROM_ROBOT_ROT.apply(np.asarray(points, dtype=np.float64) - _WORLD_IN_ROBOT_TRANSLATION_M)
+
+
+def _robot_to_world_pose(translation: np.ndarray, rotation_xyzw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    world_translation = _robot_to_world_points(np.asarray(translation, dtype=np.float64))
+    world_rotation = _WORLD_FROM_ROBOT_ROT * Rotation.from_quat(np.asarray(rotation_xyzw, dtype=np.float64))
+    return world_translation, world_rotation.as_quat()
+
+
 def _build_blueprint(cam_keys: list[str], cam_names: dict[str, str]) -> rrb.Blueprint:
     cam_views = [
         rrb.Spatial2DView(origin=k, name=f"{k}: {cam_names.get(k, k)}")
@@ -81,12 +98,14 @@ def _build_blueprint(cam_keys: list[str], cam_names: dict[str, str]) -> rrb.Blue
 def _log_arm(side: str, q: np.ndarray, ee_pos: np.ndarray, ee_quat: np.ndarray) -> None:
     chain = franka_fk_chain(q)
     points = np.vstack([np.zeros((1, 3)), chain[:, :3, 3]])  # base + 7 joints + EE
+    points = _robot_to_world_points(points)
+    ee_pos_world, ee_quat_world = _robot_to_world_pose(ee_pos, ee_quat)
     rr.log(f"{side}_arm/skeleton",
            rr.LineStrips3D([points], colors=[(180, 180, 220)], radii=0.005))
     rr.log(f"{side}_arm/joints",
            rr.Points3D(points, colors=(200, 80, 80), radii=0.015))
     rr.log(f"{side}_arm/ee_target",
-           rr.Transform3D(translation=ee_pos, rotation=rr.Quaternion(xyzw=ee_quat)))
+        rr.Transform3D(translation=ee_pos_world, rotation=rr.Quaternion(xyzw=ee_quat_world)))
     rr.log(f"{side}_arm/ee_target/origin",
            rr.Points3D([[0.0, 0.0, 0.0]], colors=(80, 200, 80), radii=0.02))
 
