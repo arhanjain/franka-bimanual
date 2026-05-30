@@ -36,7 +36,7 @@ for fname in images:
         corners2 = cv.cornerSubPix(gray,corners, (11,11), (-1,-1), criteria)
         imgpoints.append(corners2)
 
-        # Draw and display the corners
+        # Draw corners; optionally display for debugging
         cv.drawChessboardCorners(img, (8,13), corners2, ret)
         cv.imshow('img', img)
         cv.waitKey()
@@ -60,6 +60,12 @@ for i, (rvec, tvec) in enumerate(zip(rvecs, tvecs)):
     print("Camera pose in chessboard/world coords:")
     print("R_cam_in_board:\n", R_cam_in_board)
     print("t_cam_in_board:\n", t_cam_in_board)
+    # Compute camera position relative to the chessboard geometric center
+    # objp is the object points used (same origin as the calibration), so
+    # the chessboard center in board coordinates is the mean of objp.
+    center_board = np.mean(objp, axis=0).reshape(3, 1)
+    t_cam_wrt_center = t_cam_in_board - center_board
+    print("Camera position w.r.t. chessboard center (meters):\n", t_cam_wrt_center.flatten())
     
 mean_error = 0
 for i in range(len(objpoints)):

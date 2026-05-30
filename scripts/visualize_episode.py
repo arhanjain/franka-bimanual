@@ -57,21 +57,19 @@ def _action_mode(action_names: Sequence[str]) -> str:
     return "joint"
 
 
-def _build_blueprint(cam_keys: list[str], cam_names: dict[str, str], arm_prefixes: list[str], has_depth: bool) -> rrb.Blueprint:
+def _build_blueprint(cam_keys: list[str], cam_names: dict[str, str]) -> rrb.Blueprint:
     cam_views = [
         rrb.Spatial2DView(origin=k, name=f"{k}: {cam_names.get(k, k)}")
         for k in cam_keys
     ]
-    depth_view = rrb.Spatial3DView(origin="depth", name="Depth cloud") if has_depth else None
-    arm_views = [rrb.Spatial3DView(origin=f"{arm}_arm", name=f"{arm.upper()} arm") for arm in arm_prefixes]
-    if not arm_views:
-        arm_views = [rrb.Spatial3DView(origin="l_arm", name="Arm")]
     return rrb.Blueprint(
         rrb.Vertical(
             rrb.Horizontal(*cam_views),
-            rrb.Horizontal(
-                *arm_views,
-                *([depth_view] if depth_view is not None else []),
+            rrb.Spatial3DView(
+                origin="/",
+                name="3D scene",
+                line_grid=rrb.LineGrid3D(visible=True),
+                eye_controls=rrb.EyeControls3D(),
             ),
             rrb.TimeSeriesView(origin="gripper", name="Gripper cmd vs obs"),
             row_shares=[2, 4, 1],
@@ -133,7 +131,8 @@ def visualize(repo_id: str, episode_index: int, compress: bool, spawn: bool) -> 
     has_depth = any(_is_depth_name(name) for name in state_names)
 
     rr.init(f"{repo_id}/episode_{episode_index}", spawn=spawn)
-    rr.send_blueprint(_build_blueprint(cam_keys, cam_names, arm_prefixes, has_depth))
+    rr.log("/", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
+    rr.send_blueprint(_build_blueprint(cam_keys, cam_names))
 
     first_index: int | None = None
     for i in range(len(dataset)):

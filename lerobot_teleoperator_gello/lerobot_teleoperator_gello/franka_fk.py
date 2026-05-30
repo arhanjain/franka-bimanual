@@ -17,7 +17,7 @@ _DH = np.array([
     [-0.0825,  0.384,  -np.pi/2  ],  # joint 5
     [ 0.0,     0.0,     np.pi/2  ],  # joint 6
     [ 0.088,   0.0,     np.pi/2  ],  # joint 7
-    [ 0.0,     0.107,   0.0      ],  # flange-to-EE (fixed)
+    [ 0.0,     0.107+0.1034,   0.0      ],  # flange-to-EE (fixed)
 ])
 
 

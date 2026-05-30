@@ -39,4 +39,4 @@ class FramosCameraConfig(CameraConfig):
         (-0.34811877, 0.797506, -0.49274486),
         (-0.2002833, -0.5767579, -0.79198291),
     )
-    t_cam_in_world: tuple[float, float, float] = (-0.21087565, 0.50170678, 0.64699288)
+    t_cam_in_world: tuple[float, float, float] = (-0.2808756, 0.38170682, 0.64699288)

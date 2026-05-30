@@ -212,13 +212,9 @@ class BimanualFranka(Robot):
         return obs
 
     def _ee_world_center(self, kin: dict[str, KinematicSnapshot]) -> np.ndarray:
-        ee_world_points: list[np.ndarray] = []
-        for arm in self.active_arms:
-            pos_robot = np.asarray(kin[arm][3], dtype=np.float64)
-            ee_world_points.append(self._r_robot_in_world @ pos_robot + self._t_robot_in_world)
-        if not ee_world_points:
-            return np.zeros(3, dtype=np.float64)
-        return np.mean(np.vstack(ee_world_points), axis=0)
+        arm = "r" if "r" in self.active_arms else self.active_arms[0]
+        ee_robot = np.asarray(kin[arm][3], dtype=np.float64)
+        return self._r_robot_in_world @ ee_robot + self._t_robot_in_world
 
     def _sample_depth_points(self, verts: list[tuple[float, float, float]], center: np.ndarray) -> np.ndarray:
         points = np.asarray(verts, dtype=np.float64).reshape(-1, 3)

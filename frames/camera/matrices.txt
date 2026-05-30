@@ -14,3 +14,5 @@ t_cam_in_board:
  [[-0.21087565]
  [ 0.50170678]
  [ 0.64699288]]
+Camera position w.r.t. chessboard center (meters):
+ [-0.2808756   0.38170682  0.64699288]
