@@ -35,7 +35,7 @@ class GelloEE(Gello):
         joint_action = self._get_raw_action()  # unprefixed; we apply prefix once at the bottom
         q = np.array([joint_action[f"joint_{i}"] for i in range(1, 8)])
         pos, quat_xyzw = franka_fk(q)
-        return self._maybe_prefix({
+        return {**self._maybe_prefix({
             "x":      float(pos[0]),
             "y":      float(pos[1]),
             "z":      float(pos[2]),
@@ -44,4 +44,6 @@ class GelloEE(Gello):
             "qz":     float(quat_xyzw[2]),
             "qw":     float(quat_xyzw[3]),
             "gripper": joint_action["gripper"]
-        })
+        }),
+            **{"kp": 0.0,
+               "kd": 0.0}}

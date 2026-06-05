@@ -191,7 +191,9 @@ class Gello(Teleoperator):
     def get_action(self) -> dict[str, float]:
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
-        return self._maybe_prefix(self._get_raw_action())
+        return {**self._maybe_prefix(self._get_raw_action()),
+            **{"kp": 0.0,
+               "kd": 0.0}}
 
     def send_feedback(self, feedback: dict[str, float]) -> None:
         raise NotImplementedError

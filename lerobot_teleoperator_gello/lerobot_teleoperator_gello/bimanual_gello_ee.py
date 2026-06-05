@@ -124,6 +124,8 @@ class BimanualGelloEE(Teleoperator):
         return {
             **{f"l_{k}": v for k, v in left.items()},
             **{f"r_{k}": v for k, v in right.items()},
+            **{"kp": 0.0,
+               "kd": 0.0}
         }
 
     def send_feedback(self, feedback: dict[str, float]) -> None:
