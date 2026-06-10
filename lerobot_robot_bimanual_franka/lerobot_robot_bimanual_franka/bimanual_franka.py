@@ -38,6 +38,7 @@ EE_AXIS_KEYS: tuple[str, ...] = ("x", "y", "z", "qx", "qy", "qz", "qw")
 _CAMERA_CTORS: dict[type, type] = {FramosCameraConfig: FramosCamera, ArvCameraConfig: ArvCamera}
 
 _DEPTH_POINT_AXES: tuple[str, ...] = ("x", "y", "z")
+_DEPTH_FLAT_SIZE: int = _DEPTH_POINT_COUNT * len(_DEPTH_POINT_AXES)  # 6144
 
 logger = logging.getLogger(__name__)
 
@@ -98,18 +99,7 @@ class BimanualFranka(Robot):
         return {f"{arm}_{key}": float for arm in self.active_arms for key in keys}
 
     def _depth_features(self) -> dict[str, type]:
-        return {
-            f"depth_{point_index:04d}_{axis}": float
-            for point_index in range(_DEPTH_POINT_COUNT)
-            for axis in _DEPTH_POINT_AXES
-        }
-
-    def _depth_feature_names(self) -> list[str]:
-        return [
-            f"depth_{point_index:04d}_{axis}"
-            for point_index in range(_DEPTH_POINT_COUNT)
-            for axis in _DEPTH_POINT_AXES
-        ]
+        return {f"depth_{i}": float for i in range(_DEPTH_FLAT_SIZE)}
 
     @cached_property
     def _camera_features(self) -> dict[str, tuple[int, int, int]]:
@@ -119,7 +109,7 @@ class BimanualFranka(Robot):
                 raise RuntimeError(f"Camera '{n}' does not report height/width")
             out[n] = (int(cam.height), int(cam.width), IMAGE_CHANNELS)
         return out
-    
+
     @property
     def observation_features(self) -> dict[str, type | tuple[int, int, int]]:
         if self._use_depth:
@@ -213,10 +203,9 @@ class BimanualFranka(Robot):
             get_depth = getattr(depth_cam, "get_depth")
             verts = self._camera_pool.submit(get_depth).result()
             ee_world = self._ee_world_center(kin)
-            depth_points = self._sample_depth_points(verts, ee_world)
-            flat_depth = depth_points.reshape(-1)
-            for name, value in zip(self._depth_feature_names(), flat_depth, strict=True):
-                obs[name] = float(value)
+            flat = self._sample_depth_points(verts, ee_world).reshape(-1)
+            for i, v in enumerate(flat):
+                obs[f"depth_{i}"] = float(v)
         return obs
 
     def _ee_world_center(self, kin: dict[str, KinematicSnapshot]) -> np.ndarray:
@@ -407,6 +396,7 @@ class BimanualFranka(Robot):
     def cache_delta(self, dpos: np.ndarray, drot: np.ndarray) -> None:
         self.delta_pos = dpos
         self.delta_rot = drot
+        print(self.delta_pos, self.delta_rot)
 
     @staticmethod
     def _ee_pose_errors(target: np.ndarray, snap: KinematicSnapshot) -> tuple[np.ndarray, np.ndarray]:
@@ -445,8 +435,10 @@ class BimanualFranka(Robot):
     def _ee_velocity_toward_pose(kp_gain: float, kd_gain: float, target: np.ndarray, snap: KinematicSnapshot, dpos: np.ndarray | None = None, drot: np.ndarray | None = None) -> np.ndarray:
         pos_error, rot_error = BimanualFranka._ee_pose_errors(target, snap)
         if dpos is not None:
+            print("dpos:", dpos)
             pos_error += dpos
         if drot is not None:
+            print("drot:", drot)
             rot_error += drot
         _, _, _, _, _, twist = snap
         return (EE_PD_KP * kp_gain) * np.concatenate((pos_error, rot_error)) - (EE_PD_KD * kd_gain) * np.asarray(twist, dtype=np.float64)

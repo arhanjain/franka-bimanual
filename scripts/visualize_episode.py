@@ -41,15 +41,22 @@ def _camera_names() -> dict[str, str]:
     return {k: v.name for k, v in default_factory().items()}
 
 
-def _is_depth_name(name: str) -> bool:
-    return name.startswith("depth_")
+# Keys under which a point-cloud feature may be stored in the dataset,
+# in order of preference (new format first, then legacy image path).
+_DEPTH_FEATURE_KEYS = ("observation.depth_points", "observation.images.depth_points")
+
+
+def _depth_key(features: dict) -> str | None:
+    """Return the dataset feature key for depth points, or None if absent."""
+    for key in _DEPTH_FEATURE_KEYS:
+        if key in features:
+            return key
+    return None
 
 
 def _arm_prefixes(names: Sequence[str]) -> list[str]:
     prefixes: list[str] = []
     for name in names:
-        if _is_depth_name(name):
-            continue
         prefix, _, suffix = name.partition("_")
         if prefix in ("l", "r") and suffix:
             if prefix not in prefixes:
@@ -118,15 +125,13 @@ def _log_depth(depth: np.ndarray | torch.Tensor) -> None:
     rr.log("depth", rr.Points3D(points, colors=(120, 180, 255), radii=0.004))
 
 
-def _extract_depth_points(state: np.ndarray | torch.Tensor, state_names: list[str]) -> np.ndarray | None:
+def _extract_depth_from_state(state: np.ndarray | torch.Tensor, state_names: list[str]) -> np.ndarray | None:
+    """Legacy: reconstruct a (N, 3) point cloud from flat depth_* scalars in observation.state."""
     values = state.detach().cpu().numpy() if isinstance(state, torch.Tensor) else np.asarray(state)
-    depth_indices = [index for index, name in enumerate(state_names) if _is_depth_name(name)]
-    if len(depth_indices) < 3:
+    depth_indices = [i for i, name in enumerate(state_names) if name.startswith("depth_")]
+    if len(depth_indices) < 3 or len(depth_indices) % 3 != 0:
         return None
-    depth_values = values[depth_indices]
-    if depth_values.size % 3 != 0:
-        return None
-    return depth_values.reshape(-1, 3)
+    return values[depth_indices].reshape(-1, 3)
 
 
 def _arm_block(names: Sequence[str], arm: str) -> tuple[int, int] | None:
@@ -141,13 +146,18 @@ def _arm_block(names: Sequence[str], arm: str) -> tuple[int, int] | None:
 
 def visualize(repo_id: str, episode_index: int, compress: bool, spawn: bool) -> None:
     dataset = LeRobotDataset(repo_id, episodes=[episode_index])
-    cam_keys = list(dataset.meta.camera_keys)
+    depth_feat_key = _depth_key(dataset.features)
+    # Exclude the depth-points key from camera rendering even if the pipeline
+    # stored it under observation.images.* (it is not a real RGB video).
+    cam_keys = [k for k in dataset.meta.camera_keys if k != depth_feat_key]
     cam_names = _camera_names()
     action_names = list(dataset.meta.names["action"])
     state_names = list(dataset.meta.names["observation.state"])
     arm_prefixes = _arm_prefixes(action_names)
     mode = _action_mode(action_names)
-    has_depth = any(_is_depth_name(name) for name in state_names)
+    # New format: dedicated depth_points feature.  Legacy: depth_* scalars in state.
+    has_depth_feature = depth_feat_key is not None
+    has_depth_in_state = not has_depth_feature and any(n.startswith("depth_") for n in state_names)
 
     rr.init(f"{repo_id}/episode_{episode_index}", spawn=spawn)
     rr.log("/", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
@@ -169,8 +179,10 @@ def visualize(repo_id: str, episode_index: int, compress: bool, spawn: bool) -> 
         action = frame["action"].numpy()
         state = frame["observation.state"].numpy()
 
-        if has_depth:
-            depth_points = _extract_depth_points(state, state_names)
+        if has_depth_feature:
+            _log_depth(frame[depth_feat_key])
+        elif has_depth_in_state:
+            depth_points = _extract_depth_from_state(state, state_names)
             if depth_points is not None:
                 _log_depth(depth_points)
 
