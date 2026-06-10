@@ -396,7 +396,6 @@ class BimanualFranka(Robot):
     def cache_delta(self, dpos: np.ndarray, drot: np.ndarray) -> None:
         self.delta_pos = dpos
         self.delta_rot = drot
-        print(self.delta_pos, self.delta_rot)
 
     @staticmethod
     def _ee_pose_errors(target: np.ndarray, snap: KinematicSnapshot) -> tuple[np.ndarray, np.ndarray]:
@@ -435,10 +434,8 @@ class BimanualFranka(Robot):
     def _ee_velocity_toward_pose(kp_gain: float, kd_gain: float, target: np.ndarray, snap: KinematicSnapshot, dpos: np.ndarray | None = None, drot: np.ndarray | None = None) -> np.ndarray:
         pos_error, rot_error = BimanualFranka._ee_pose_errors(target, snap)
         if dpos is not None:
-            print("dpos:", dpos)
             pos_error += dpos
         if drot is not None:
-            print("drot:", drot)
             rot_error += drot
         _, _, _, _, _, twist = snap
         return (EE_PD_KP * kp_gain) * np.concatenate((pos_error, rot_error)) - (EE_PD_KD * kd_gain) * np.asarray(twist, dtype=np.float64)

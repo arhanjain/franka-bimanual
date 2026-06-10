@@ -195,7 +195,9 @@ class ResidualPolicy:
             (8,) — [dx, dy, dz, rx, ry, rz, kp, kd], all normalised.
         """
         res = np.zeros(8, dtype=np.float32)
-        # res[2] = 0.0
+        res[2] = 0.0
+        res[6] = 0.3
+        res[7] = 1.0
         return res
 
 
