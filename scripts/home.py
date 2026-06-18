@@ -47,21 +47,21 @@ logger = logging.getLogger("home")
 MIRROR_SIGN = np.array([-1, 1, -1, 1, -1, 1, -1], dtype=np.float64)
 
 # Built-in home, used by `apply` when no saved <name>.json exists. A symmetric
-# mirror pair. SIM CONVENTION (left/right as seen facing the robots): luigi is
-# the RIGHT arm = code-l, mario is the LEFT arm = code-r. So r_q is the sim LEFT
-# default (robot.py LEFT_PANDA_DEFAULT_JOINT_POS) and l_q is its exact joint
-# mirror (j1,j3,j5,j7 negated). This makes the two EEs symmetric across the env
-# X-Z plane -- equal x and z, mirrored y (verified to ~3mm in x). The sim's own
-# RIGHT default is NOT used because its j1 (+0.44) isn't the mirror of left's
-# (-0.61), which left the EE x ~6cm asymmetric.
+# mirror pair. Left/right are as seen facing the arms: code l = mario (sim RIGHT
+# arm, env +y), code r = luigi (sim LEFT arm, env -y). r_q is the sim LEFT default
+# (robot.py LEFT_PANDA_DEFAULT_JOINT_POS) and l_q is its exact joint mirror
+# (j1,j3,j5,j7 negated), giving EEs symmetric across the env X-Z plane (equal x,z;
+# mirrored y, ~3mm in x). The sim's own RIGHT default is NOT used because its j1
+# (+0.44) isn't the mirror of left's (-0.61), leaving the EE x ~6cm asymmetric.
 _DEFAULT_POSE = {
-    "l_q": [0.6109, -0.6109, 0.0, -2.3562, 0.0, 1.8326, -0.7854],
-    "r_q": [-0.6109, -0.6109, 0.0, -2.3562, 0.0, 1.8326, 0.7854],
+    "r_q": [0.6109, -0.6109, 0.0, -2.3562, 0.0, 1.8326, -0.7854],
+    "l_q": [-0.6109, -0.6109, 0.0, -2.3562, 0.0, 1.8326, 0.7854],
 }
 
+# l = mario = sim LEFT, r = luigi = sim RIGHT (left/right as seen facing robots).
 _RIG = dict(
-    l_server_ip="192.168.3.11", l_robot_ip="192.168.200.2", l_port=18813,
-    r_server_ip="192.168.3.10", r_robot_ip="192.168.201.10", r_port=18812,
+    l_server_ip="192.168.3.10", l_robot_ip="192.168.201.10", l_port=18812,
+    r_server_ip="192.168.3.11", r_robot_ip="192.168.200.2", r_port=18813,
 )
 
 

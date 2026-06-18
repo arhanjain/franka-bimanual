@@ -67,16 +67,17 @@ def parse_args() -> argparse.Namespace:
     # Which arms to drive. "l" or "r" runs a single arm with one SpaceMouse;
     # "lr" runs both. Only the selected arms are connected/commanded.
     p.add_argument("--arms", choices=("l", "r", "lr"), default="lr")
-    # Network (defaults match EnvFrameFrankaConfig / spacemouse_teleop.sh).
-    p.add_argument("--l-server-ip", default="192.168.3.11")
-    p.add_argument("--l-robot-ip", default="192.168.200.2")
-    p.add_argument("--l-port", type=int, default=18813)
-    p.add_argument("--r-server-ip", default="192.168.3.10")
-    p.add_argument("--r-robot-ip", default="192.168.201.10")
-    p.add_argument("--r-port", type=int, default=18812)
+    # Network (defaults match EnvFrameFrankaConfig). l = mario = sim LEFT,
+    # r = luigi = sim RIGHT (left/right as seen facing the robots).
+    p.add_argument("--l-server-ip", default="192.168.3.10")
+    p.add_argument("--l-robot-ip", default="192.168.201.10")
+    p.add_argument("--l-port", type=int, default=18812)
+    p.add_argument("--r-server-ip", default="192.168.3.11")
+    p.add_argument("--r-robot-ip", default="192.168.200.2")
+    p.add_argument("--r-port", type=int, default=18813)
     # SpaceMouse devices.
-    p.add_argument("--left-hidraw", default="/dev/hidraw2")
-    p.add_argument("--right-hidraw", default="/dev/hidraw3")
+    p.add_argument("--left-hidraw", default="/dev/hidraw3")
+    p.add_argument("--right-hidraw", default="/dev/hidraw2")
     # Mapping/scale tuning lives in _ENV_TUNING (single source), not here.
     p.add_argument("--fps", type=float, default=30.0)
     return p.parse_args()
@@ -112,8 +113,22 @@ def main() -> None:
         ))
 
     robot = EnvFrameFranka(robot_cfg)
-    # connect() is inside the try so a Ctrl-C during the (possibly lengthy) FCI
-    # connect-retry window still runs _shutdown and releases the session.
+
+    # Ctrl-C during the loop sets a flag instead of raising, so the loop exits
+    # BETWEEN ticks. Interrupting mid-send_action would abandon an in-flight RPyC
+    # request on a pool worker; that wedged worker then blocks process exit (the
+    # ThreadPoolExecutor atexit join waits on it) and, because _shutdown has set
+    # SIGINT to SIG_IGN, a second Ctrl-C can't free it -> "won't quit" (kill -9).
+    # The handler is installed only once the loop owns the main thread; before
+    # that (the lengthy FCI connect-retry window) the default KeyboardInterrupt
+    # still aborts straight into the finally.
+    stop_requested = False
+
+    def _request_stop(signum, frame):
+        nonlocal stop_requested
+        stop_requested = True
+        logger.info("Ctrl-C received; finishing current tick, then stopping.")
+
     try:
         robot.connect()
         teleop.connect()
@@ -125,12 +140,12 @@ def main() -> None:
             leader_obj.seed_state(pos, quat_xyzw)
             logger.info("Seeded %s arm from env-frame EE pos=%s", arm, pos)
 
+        signal.signal(signal.SIGINT, _request_stop)
         period = 1.0 / args.fps
         logger.info("Starting teleop loop at %.1f Hz, arms=%s (Ctrl-C to stop).", args.fps, args.arms)
-        while True:
+        while not stop_requested:
             t0 = time.perf_counter()
             raw = teleop.get_action()
-            print(raw)
             # Bimanual teleop already emits l_/r_ prefixes; single arm does not.
             action = raw if bimanual else {f"{arms[0]}_{k}": v for k, v in raw.items()}
             robot.send_action(action)
@@ -138,7 +153,8 @@ def main() -> None:
             if dt < period:
                 time.sleep(period - dt)
     except KeyboardInterrupt:
-        logger.info("Ctrl-C received; stopping the arm and disconnecting.")
+        # Ctrl-C during connect/seed, before the loop installed its handler.
+        logger.info("Ctrl-C received during startup; stopping and disconnecting.")
     finally:
         _shutdown(robot, teleop)
 

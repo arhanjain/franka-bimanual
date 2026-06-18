@@ -21,9 +21,9 @@ ARM="${1:-lr}"
 
 python "$(dirname "$0")/home.py" apply home_pose \
     --arm="$ARM" \
-    --l-server-ip=192.168.3.11 \
-    --l-robot-ip=192.168.200.2 \
-    --l-port=18813 \
-    --r-server-ip=192.168.3.10 \
-    --r-robot-ip=192.168.201.10 \
-    --r-port=18812
+    --l-server-ip=192.168.3.10 \
+    --l-robot-ip=192.168.201.10 \
+    --l-port=18812 \
+    --r-server-ip=192.168.3.11 \
+    --r-robot-ip=192.168.200.2 \
+    --r-port=18813

@@ -18,10 +18,19 @@ Three machines, two arms, two grippers, six cameras:
   - `~/franka_data/` holds rollouts, datasets, trained policies. **Never
     commit data into the repo.**
   - `~/franka_ws/` is this workspace.
-- **`mario@192.168.3.10`** NUC controls the **right** arm
+- Arm sides are **as seen facing the arms** (sim convention; the sim is ground
+  truth). The sim's `left_panda`/`right_panda` are named from the opposite POV,
+  so each NUC's physical side maps to the *opposite* sim panda name (see below).
+- **`mario@192.168.3.10`** NUC controls the **left** arm
   (`192.168.201.10`, gripper `192.168.2.20`, RPyC port `18812`).
-- **`luigi@192.168.3.11`** NUC controls the **left** arm
+  Env +y side; = sim **`right_panda`**.
+- **`luigi@192.168.3.11`** NUC controls the **right** arm
   (`192.168.200.2`, gripper `192.168.2.21`, RPyC port `18813`).
+  Env −y side; = sim **`left_panda`**.
+- Env-frame stack (`lerobot_robot_envframe_franka`) keys arms `l`/`r` by side:
+  **`l` = left = mario**, **`r` = right = luigi**. (The legacy joint-mode
+  `lerobot_robot_bimanual_franka` stack historically used the opposite `l=luigi`
+  binding — don't assume the two stacks agree.)
 - Six GigE cameras (4× Basler ARV, 2× FRAMOS D415e) — IP/serial map in
   `BimanualFrankaConfig` and the README.
 

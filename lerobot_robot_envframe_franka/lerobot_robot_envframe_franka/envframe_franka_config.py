@@ -8,21 +8,22 @@ _VALID_ARMS: tuple[str, ...] = ("l", "r")
 # quaternion_wxyz) of the arm base in the shared, world-aligned env frame.
 # Quaternion is WXYZ here (IsaacLab convention); the robot converts to xyzw.
 #
-# The left base matches the sim scene
-# (src/sim_improvement/environments/lbm/scenario_rollout_cfg.py:66-82). The real
-# RIGHT arm is mounted ~180deg about env-Z from the sim value (sim yaw +47deg
-# would make it asymmetric with the left's +137deg; the corrected -133deg is the
-# expected mirror). Using the sim value made env +X/+Y commands drive the real
-# right EE backwards and would mirror sim-trajectory replay on that arm.
-# Corrected = Rz(180deg) * R_sim_right (yaw only; pitch/roll preserved).
+# Identity (positions = scenario_rollout_cfg.py:66-82; IP defaults below agree):
+#   code l = sim left_panda  = mario NUC (192.168.3.10) = env -y (-0.34362)
+#   code r = sim right_panda = luigi NUC (192.168.3.11) = env +y (+0.32962)
+# Env axes: +x toward workspace, +y, +z up.
 #
-# NOTE: these are hardware-tuned per arm (code-l=luigi, code-r=mario). Do NOT
-# swap l/r here -- doing so rotates teleop twists and breaks the axes. The env
-# observation / home symmetry questions are separate; resolve the physical arm
-# assignment with scripts/misc/env_jog.py before touching these.
+# POSITIONS are the verbatim sim placements. ORIENTATIONS are the sim
+# quaternions RE-AIMED -90deg (90 CW viewed from above) about env +z, so each
+# base +x faces env +x (the workspace) instead of the sim scene's +y-ish
+# mounting. Deliberate divergence from the raw sim -- to re-sync, re-take the
+# sim quats and re-apply Rz(-90deg) about env z.
+# NOTE: re-aim not yet re-confirmed on hardware via scripts/misc/env_jog.py.
+
+# wxyz (sim orientation re-aimed -90deg about env z; see above)
 _DEFAULT_BASE_IN_ENV: dict[str, tuple[tuple[float, ...], tuple[float, ...]]] = {
-    "l": ((-0.5937, -0.34362, -0.08484), (0.36811, 0.01027, 0.00078, 0.92973)),
-    "r": ((-0.5937, 0.32962, -0.08062), (-0.39909, -0.01089, 0.01312, 0.91675)),
+    "r": ((-0.5937, 0.32962, -0.08062), (0.93044, 0.01698, -0.00158, -0.36604)),
+    "l": ((-0.5937, -0.34362, -0.08484), (0.91771, 0.00781, -0.00671, 0.39712)),
 }
 
 
@@ -34,12 +35,16 @@ class EnvFrameFrankaConfig(RobotConfig):
     Network defaults match scripts/spacemouse_teleop.sh.
     """
 
-    l_server_ip: str = "192.168.3.11"
-    l_robot_ip: str = "192.168.200.2"
-    l_port: int = 18813
-    r_server_ip: str = "192.168.3.10"
-    r_robot_ip: str = "192.168.201.10"
-    r_port: int = 18812
+    # Arm naming follows SIM convention (left/right as seen facing the robots):
+    #   l = LEFT = mario NUC (192.168.3.10, robot 192.168.201.10, port 18812)
+    #   r = RIGHT = luigi NUC (192.168.3.11, robot 192.168.200.2, port 18813)
+    # This makes code l/r match sim left/right and the base_in_env below correct.
+    l_server_ip: str = "192.168.3.10"
+    l_robot_ip: str = "192.168.201.10"
+    l_port: int = 18812
+    r_server_ip: str = "192.168.3.11"
+    r_robot_ip: str = "192.168.200.2"
+    r_port: int = 18813
 
     active_arms: tuple[str, ...] = _VALID_ARMS
 

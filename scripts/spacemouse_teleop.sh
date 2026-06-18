@@ -18,8 +18,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 python scripts/spacemouse_teleop.py \
-    --l-server-ip 192.168.3.11 --l-robot-ip 192.168.200.2 --l-port 18813 \
-    --r-server-ip 192.168.3.10 --r-robot-ip 192.168.201.10 --r-port 18812 \
-    --left-hidraw /dev/hidraw2 --right-hidraw /dev/hidraw3 \
+    --l-server-ip 192.168.3.10 --l-robot-ip 192.168.201.10 --l-port 18812 \
+    --r-server-ip 192.168.3.11 --r-robot-ip 192.168.200.2 --r-port 18813 \
+    --left-hidraw /dev/hidraw3 --right-hidraw /dev/hidraw2 \
     --fps 30 \
     "$@"
