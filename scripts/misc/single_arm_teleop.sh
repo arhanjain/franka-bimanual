@@ -27,3 +27,4 @@ lerobot-teleoperate \
     --teleop.side=r \
     --teleop.port=$PORT \
     --fps=20
+    # --robot.r_gripper_ip=192.168.2.20 \

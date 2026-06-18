@@ -1,0 +1,65 @@
+# Workspace root for the bimanual Franka FR3 control stack.
+#
+# This repo is five editable LeRobot plugin packages; this file binds them into
+# a single uv workspace so the whole rig installs with one `uv sync`.
+#
+# Two deps cannot go through normal resolution and stay manual:
+#   1. pyrealsense2 — FRAMOS SDK build, NOT on PyPI. After `uv sync`, run:
+#        uv pip install --no-build-isolation ~/librealsense2/wrappers/python/
+#   2. net_franky — kept as a plain requirement to match the existing
+#      `uv pip install net_franky` flow. If it is not on your configured index,
+#      add a [tool.uv.sources] entry (git/path) for it below.
+
+[project]
+name = "franka-bimanual"
+version = "0.1.0"
+description = "Bimanual Franka FR3 real-world control stack — LeRobot plugin workspace for the TRI rig."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # LeRobot core (the CLIs: lerobot-teleoperate/-record/-replay/-train).
+    "lerobot[all]",
+    # Workspace members (resolved locally via [tool.uv.sources]).
+    "lerobot_camera_arv",
+    "lerobot_camera_framos",
+    "lerobot_robot_bimanual_franka",
+    "lerobot_robot_envframe_franka",
+    "lerobot_teleoperator_gello",
+    "lerobot_teleoperator_spacemouse",
+    # Non-PyPI / not pulled in by lerobot[all].
+    "net_franky",
+    "PyGObject<3.52",
+    "pyspacemouse>=2.0",
+    "dynamixel-sdk>=3.8",
+    "scipy",
+    "opencv-python-headless",
+    "open3d>=0.19.0",
+    # NOTE: pyrealsense2 is intentionally NOT listed. The D415e needs the
+    # FRAMOS-built binding (v2.55), compiled from ~/librealsense2 and installed
+    # with `uv pip install --no-build-isolation ~/librealsense2/wrappers/python/`.
+    # Listing it here would let `uv sync` reinstall the wrong PyPI wheel over it.
+]
+
+# The repo root is not itself an importable package — just the workspace anchor.
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = [
+    "lerobot_camera_arv",
+    "lerobot_camera_framos",
+    "lerobot_robot_bimanual_franka",
+    "lerobot_robot_envframe_franka",
+    "lerobot_teleoperator_gello",
+    "lerobot_teleoperator_spacemouse",
+]
+
+# Resolve intra-repo deps (e.g. bimanual_franka -> camera_arv/camera_framos)
+# from the workspace instead of an index.
+[tool.uv.sources]
+lerobot_camera_arv = { workspace = true }
+lerobot_camera_framos = { workspace = true }
+lerobot_robot_bimanual_franka = { workspace = true }
+lerobot_robot_envframe_franka = { workspace = true }
+lerobot_teleoperator_gello = { workspace = true }
+lerobot_teleoperator_spacemouse = { workspace = true }

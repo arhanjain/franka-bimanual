@@ -34,6 +34,11 @@ _RECOVERABLE_ERRORS = (
     "communication_constrains_violation",
     'current mode ("Reflex")',
     "type of motion cannot change",
+    # Overlapping 100ms async velocity motions at the teleop rate can desync
+    # after a transient fault/dropped tick, leaving a motion registered so the
+    # next move() is rejected. recover_from_errors() clears it; otherwise it
+    # cascades every tick and the arm stops responding.
+    "Attempted to start multiple motions",
 )
 
 # (q, dq, jacobian, ee_pos, ee_rot_xyzw, ee_twist)
@@ -104,6 +109,17 @@ def stop(robot, use_ee):
     else:
         m = _fr.JointVelocityMotion(_ZERO_J, _DUR)
     robot.move(m, asynchronous=False)
+
+def reset(robot):
+    # join_motion() ends the async control thread and surfaces/clears the stored
+    # async exception, re-syncing franky with libfranka. recover_from_errors()
+    # alone leaves franky thinking a motion is still active, so the next move()
+    # raises "Attempted to start multiple motions" -- forever. Join first.
+    try:
+        robot.join_motion()
+    except Exception:
+        pass
+    robot.recover_from_errors()
 """
 
 

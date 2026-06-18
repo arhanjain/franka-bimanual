@@ -1,0 +1,34 @@
+Metadata-Version: 2.4
+Name: lerobot_robot_envframe_franka
+Version: 0.1.0
+Summary: Minimal env-frame EE-pose bimanual Franka integration for LeRobot.
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: lerobot
+Requires-Dist: net_franky
+Requires-Dist: scipy
+
+# lerobot_robot_envframe_franka
+
+A minimal LeRobot robot package for the bimanual Franka setup that speaks the
+**sim env frame** (world-aligned axes, shared origin at the env origin), the
+same convention as the sim `DualArmEnvFrameDiffIKAction`.
+
+Scope (intentionally minimal):
+- **EE pose control only** — no joint mode, no gripper, no cameras.
+- Actions and observations are **absolute EE poses in the env frame**:
+  `{arm}_{x,y,z,qx,qy,qz,qw}` per active arm (quaternion is xyzw).
+- The robot is **stateless**: the action *is* the absolute target. `send_action`
+  transforms the env-frame target into each arm's base frame and commands a
+  franky absolute `CartesianMotion`. `get_observation` transforms the measured
+  base-frame `O_T_EE` back into the env frame.
+
+Because actions mirror the sim action term 1:1, a sim-recorded env-frame EE
+trajectory can be replayed directly on the real robot.
+
+Transport reuses the RPyC + net_franky server-helper pattern from
+`lerobot_robot_bimanual_franka` (trimmed: no jacobian, pose helper added).
+
+Teleop with the existing spacemouse plugin: see
+`scripts/envframe_spacemouse_teleop.py` (it seeds the spacemouse from the
+robot's env-frame EE so there is no startup jump).

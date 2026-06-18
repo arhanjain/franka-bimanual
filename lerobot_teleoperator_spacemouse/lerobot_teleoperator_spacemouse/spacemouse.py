@@ -172,11 +172,14 @@ class SpaceMouse(Teleoperator):
         ], dtype=np.float64)
 
         # Integrate orientation: compose a small-angle rotation onto cur_rot.
-        # Rotation.from_euler interprets the angles as intrinsic xyz (roll/pitch/yaw).
+        # rotation_axis_map picks which device channel (roll/pitch/yaw) drives
+        # each output axis (default identity); rotation_signs flips each.
+        rpy = (state.roll, state.pitch, state.yaw)
+        ax, ay, az = self.config.rotation_axis_map
         delta_rot = Rotation.from_euler("xyz", [
-            state.roll  * r_scale * rx,
-            state.pitch * r_scale * ry,
-            state.yaw   * r_scale * rz,
+            rpy[ax] * r_scale * rx,
+            rpy[ay] * r_scale * ry,
+            rpy[az] * r_scale * rz,
         ])
         self.cur_rot = delta_rot * self.cur_rot
 

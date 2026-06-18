@@ -258,8 +258,8 @@ class BimanualFranka(Robot):
     def send_action(self, action: RobotAction) -> RobotAction:
         kin = self._cached_kin_state or self.robot_manager.current_kinematic_state_batch(list(self.active_arms))
         self._cached_kin_state = None
-        kp = np.clip(action["kp"], -1.0, 1.0)
-        kd = np.clip(action["kd"], -1.0, 1.0)
+        kp = np.clip(action.get("kp", 0.0), -1.0, 1.0)
+        kd = np.clip(action.get("kd", 0.0), -1.0, 1.0)
         kp_gain = _KP_GAIN_BASE**kp
         kd_gain = _KD_GAIN_BASE**(kd * 2 * np.sqrt(kp))
 

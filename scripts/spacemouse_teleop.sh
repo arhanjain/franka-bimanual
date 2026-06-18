@@ -1,26 +1,25 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-# Bimanual SpaceMouse teleoperation.
+# Env-frame SpaceMouse teleop for the minimal EnvFrameFranka robot.
 #
-# Left SpaceMouse:  /dev/hidraw4   (override with --teleop.left_arm_config.hidraw_path=...)
-# Right SpaceMouse: /dev/hidraw5   (override with --teleop.right_arm_config.hidraw_path=...)
+# Commands absolute EE poses in the sim env frame (world-aligned, shared origin).
+# The launcher seeds each SpaceMouse from the robot's env-frame EE on startup so
+# there is no jump. Translation signs are tuned for the env frame (-1,1,1);
+# rotation signs may still need tuning (--rotation-signs).
 #
-# The robot runs in EE-position mode (use_ee_pos=true) to match the absolute
-# pose commands produced by BimanualSpaceMouse.
+# Arms: defaults to both. Pass --arms r (or --arms l) to drive a single arm with
+# a single SpaceMouse — only that arm is connected/commanded. Examples:
+#   ./spacemouse_teleop.sh --arms r          # right arm only, /dev/hidraw3
+#   ./spacemouse_teleop.sh --arms l          # left arm only,  /dev/hidraw2
+#
+# Left SpaceMouse:  /dev/hidraw2   Right SpaceMouse: /dev/hidraw3
 
-lerobot-teleoperate \
-    --robot.type=bimanual_franka \
-    --robot.l_server_ip=192.168.3.11 \
-    --robot.l_robot_ip=192.168.200.2 \
-    --robot.l_gripper_ip=192.168.2.21 \
-    --robot.l_port=18813 \
-    --robot.r_server_ip=192.168.3.10 \
-    --robot.r_robot_ip=192.168.201.10 \
-    --robot.r_gripper_ip=192.168.2.20 \
-    --robot.r_port=18812 \
-    --robot.use_ee_pos=true \
-    --teleop.type=bimanual_spacemouse \
-    --teleop.id=spacemouse_teleop \
-    --teleop.left_arm_config.hidraw_path=/dev/hidraw2 \
-    --teleop.right_arm_config.hidraw_path=/dev/hidraw3 \
-    --fps=30
+cd "$(dirname "$0")/.."
+
+python scripts/spacemouse_teleop.py \
+    --l-server-ip 192.168.3.11 --l-robot-ip 192.168.200.2 --l-port 18813 \
+    --r-server-ip 192.168.3.10 --r-robot-ip 192.168.201.10 --r-port 18812 \
+    --left-hidraw /dev/hidraw2 --right-hidraw /dev/hidraw3 \
+    --fps 30 \
+    "$@"

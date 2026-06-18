@@ -10,7 +10,7 @@ lerobot-teleoperate \
     --robot.l_port=18813 \
     --robot.r_server_ip=192.168.3.10 \
     --robot.r_robot_ip=192.168.201.10 \
-    --robot.r_gripper_ip=192.168.2.20 \
+    --robot.r_gripper_ip=192.168.201.10 \
     --robot.r_port=18812 \
     --robot.use_ee_pos=false \
     --teleop.type=bimanual_gello \
@@ -18,3 +18,4 @@ lerobot-teleoperate \
     --teleop.left_arm_config.port=/dev/ttyUSB1 \
     --teleop.right_arm_config.port=/dev/ttyUSB0 \
     --fps=30
+    # --robot.r_gripper_ip=192.168.2.20 \

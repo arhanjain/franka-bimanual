@@ -21,10 +21,14 @@ class SpaceMouseLeaderFields:
     hidraw_path: str = "/dev/hidraw4"
 
     # Position increment (metres) per control tick at full axis deflection.
-    # pyspacemouse normalises axis values to [-1, 1].
-    translation_scale: float = 0.035
+    # pyspacemouse normalises axis values to [-1, 1]. Keep full-deflection
+    # target speed (scale * fps) at or below the arm's velocity clamp so the
+    # integrated target can't outrun the arm and "coast" after release:
+    # at fps=30, 0.010 * 30 = 0.30 m/s == EE_LINEAR_VELOCITY_MAX.
+    translation_scale: float = 0.020
     # Rotation increment (radians) per control tick at full axis deflection.
-    rotation_scale: float = 0.1
+    # 0.040 * 30 = 1.20 rad/s == EE_ANGULAR_VELOCITY_MAX.
+    rotation_scale: float = 0.020
 
     # Initial EE Cartesian position [x, y, z] in metres. Override with
     # SpaceMouse.seed_state() to sync to the arm's actual EE on startup.
@@ -36,6 +40,12 @@ class SpaceMouseLeaderFields:
     # Order: (x, y, z) for translation and (roll, pitch, yaw) for rotation.
     translation_signs: tuple[int, int, int] = field(default_factory=lambda: (1, -1, 1))
     rotation_signs: tuple[int, int, int] = field(default_factory=lambda: (1, 1, -1))
+
+    # Which device rotation channel (0=roll, 1=pitch, 2=yaw) drives each output
+    # rotation axis (x, y, z), applied before rotation_signs. Default (0,1,2) is
+    # identity. Use to match a frame whose device->frame map is a rotation/
+    # permutation, not just sign flips (e.g. the env frame's roll<->pitch swap).
+    rotation_axis_map: tuple[int, int, int] = field(default_factory=lambda: (0, 1, 2))
 
     # Gripper travel limits (mm). Right button → open, left button → close.
     gripper_min_mm: float = 0.1
@@ -61,3 +71,8 @@ class SpaceMouseConfig(TeleoperatorConfig, SpaceMouseLeaderFields):
                 raise ValueError(
                     f"SpaceMouseConfig.{name} must be a 3-tuple of +1/-1, got {signs!r}"
                 )
+        if sorted(self.rotation_axis_map) != [0, 1, 2]:
+            raise ValueError(
+                f"SpaceMouseConfig.rotation_axis_map must be a permutation of "
+                f"(0,1,2), got {self.rotation_axis_map!r}"
+            )

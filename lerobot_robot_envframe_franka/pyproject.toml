@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_robot_envframe_franka"
+version = "0.1.0"
+description = "Minimal env-frame EE-pose bimanual Franka integration for LeRobot."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "lerobot",
+    "net_franky",
+    "scipy",
+]
+
+[tool.setuptools.packages.find]
+include = ["lerobot_robot_envframe_franka", "lerobot_robot_envframe_franka.*"]
