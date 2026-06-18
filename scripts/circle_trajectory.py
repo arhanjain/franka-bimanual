@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
-"""Play an open-loop circular EE trajectory on the real EnvFrameFranka and log it.
+"""Play a circular EE trajectory on the real EnvFrameFranka and log it.
 
-For sim/real alignment: drives one or both arms around a circle in a chosen
-env-frame plane (default the z-y plane) using the same absolute-pose interface
-as teleop, while recording the commanded targets, the measured EE poses, and
-the measured joint angles ``q`` at every tick. The resulting ``.npz`` is the
-ground-truth real trajectory; replay the logged env-frame targets through the
-sim ``LBM-Scenario-ImplicitIK-State`` action and diff ``sim_q`` against the
-logged ``meas_q`` to get per-joint tracking error.
+The real arm always tracks the *absolute* circle: each tick it is commanded the
+ideal env-frame circle point ``circle_i = start + offset_i`` (self-correcting, so
+it stays on the predefined circle and returns to start). One run logs BOTH action
+representations so sim replay can choose:
 
-The circle is constructed to pass through each arm's *current* EE pose at
-phase 0 (center = current - radius * u_axis), so there is no startup jump.
-Orientation is held fixed at the measured start quaternion per arm.
+- ``target_pos`` = ``circle_i`` -- the absolute action actually sent.
+- ``delta_pos``  = ``circle_i - meas_i`` -- the relative action (the per-step
+  delta needed to move from the measured pose to the circle point this tick).
+
+These two drive different sim replays (see ``scripts/sim2real/replay_real_traj.py``):
+replaying ``target_pos`` re-anchors every tick (~no drift, baseline); replaying
+``delta_pos`` open-loop integrates the deltas onto the sim's OWN pose, so tracking
+error accumulates and the trajectory drifts off the circle -- the quantity of
+interest.
+
+Orientation is held fixed at the measured start quaternion per arm; drift is
+measured positionally.
 """
 
 import argparse
@@ -51,12 +57,12 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--arms", choices=("l", "r", "lr"), default="lr")
     # Network (defaults match EnvFrameFrankaConfig / spacemouse_teleop.sh).
-    p.add_argument("--l-server-ip", default="192.168.3.11")
-    p.add_argument("--l-robot-ip", default="192.168.200.2")
-    p.add_argument("--l-port", type=int, default=18813)
-    p.add_argument("--r-server-ip", default="192.168.3.10")
-    p.add_argument("--r-robot-ip", default="192.168.201.10")
-    p.add_argument("--r-port", type=int, default=18812)
+    p.add_argument("--l-server-ip", default="192.168.3.10")
+    p.add_argument("--l-robot-ip", default="192.168.201.10")
+    p.add_argument("--l-port", type=int, default=18812)
+    p.add_argument("--r-server-ip", default="192.168.3.11")
+    p.add_argument("--r-robot-ip", default="192.168.200.2")
+    p.add_argument("--r-port", type=int, default=18813)
     # Trajectory shape.
     p.add_argument("--plane", default="zy", help="two env-frame axes for the circle, e.g. 'zy' (default), 'xy'")
     p.add_argument("--radius", type=float, default=0.08, help="circle radius in meters")
@@ -64,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--revolutions", type=float, default=2.0, help="number of revolutions to trace")
     p.add_argument("--ramp", type=float, default=2.0,
                    help="seconds to ease radius 0->full at start and full->0 at end (no velocity jolt)")
-    p.add_argument("--fps", type=float, default=30.0)
+    p.add_argument("--fps", type=float, default=10.0)
     p.add_argument("--out", default=None, help="output .npz path (default: circle_traj_<timestamp>.npz)")
     return p.parse_args()
 
@@ -85,9 +91,13 @@ def main() -> None:
     duration = args.period * args.revolutions
     n_steps = int(round(duration * args.fps))
 
-    # Per-arm logs: commanded target + measured EE + measured joints, per tick.
+    # Per-arm logs: both action representations + measured EE + measured joints.
+    # ``target_pos`` is the absolute action sent (the ideal circle point);
+    # ``delta_pos`` = target - meas is the relative action (the per-step delta to
+    # the circle point). Sim replay picks one; see replay_real_traj.py.
     log: dict[str, dict[str, list]] = {
-        arm: {"target_pos": [], "target_quat": [], "meas_pos": [], "meas_quat": [], "meas_q": []}
+        arm: {"delta_pos": [], "target_pos": [], "target_quat": [],
+              "meas_pos": [], "meas_quat": [], "meas_q": []}
         for arm in arms
     }
     timestamps: list[float] = []
@@ -115,40 +125,56 @@ def main() -> None:
             args.revolutions, duration, args.fps, args.arms,
         )
 
+        # ``offset(t)`` is the env-frame circle offset from the start pose. The
+        # absolute circle point this tick is ``start + offset``; the relative
+        # action logged is ``(start + offset) - measured``.
+        def offset(t: float) -> np.ndarray:
+            # Ease the amplitude in/out so EE speed ramps from rest. Anchored at
+            # start (cos(0)-1 = 0) and at full revolutions (theta = 2*pi*rev),
+            # so the offset returns to zero at both ends (circle closes to start).
+            scale = 1.0
+            if args.ramp > 0.0:
+                scale = min(scale, t / args.ramp, max(0.0, (duration - t) / args.ramp))
+            theta = omega * t
+            off = np.zeros(3, dtype=np.float64)
+            off[u_axis] = args.radius * scale * (np.cos(theta) - 1.0)
+            off[v_axis] = args.radius * scale * np.sin(theta)
+            return off
+
         t_start = time.perf_counter()
         for step in range(n_steps):
             t0 = time.perf_counter()
             t = step / args.fps
 
-            # Ease the amplitude in/out about the start pose so the EE speed
-            # ramps from rest. The offset is anchored at start (cos(0)-1 = 0),
-            # so scale->0 returns to start rather than drifting to a center.
-            scale = 1.0
-            if args.ramp > 0.0:
-                scale = min(scale, t / args.ramp, max(0.0, (duration - t) / args.ramp))
-            theta = omega * t
-            du = args.radius * scale * (np.cos(theta) - 1.0)
-            dv = args.radius * scale * np.sin(theta)
+            off = offset(t)
+
+            # Read the live measured pose at tick start: used to compute the
+            # logged relative action (delta to the circle point) and to log the
+            # measured EE/joint state this tick.
+            ee_now = robot.current_ee_pose_env()           # {arm: (xyz, quat_xyzw)}
+            kin = robot.robot_manager.current_kinematic_state_batch(list(arms))
 
             action: dict[str, float] = {}
             for arm in arms:
-                target = starts[arm].copy()
-                target[u_axis] += du
-                target[v_axis] += dv
-                q_xyzw = quats[arm]
-                for key, val in zip(EE_AXIS_KEYS, (*target, *q_xyzw)):
+                # Always command the absolute circle point (self-correcting).
+                cmd_pos = starts[arm] + off
+                q_xyzw = quats[arm]  # orientation held fixed; drift is positional
+                for key, val in zip(EE_AXIS_KEYS, (*cmd_pos, *q_xyzw)):
                     action[f"{arm}_{key}"] = float(val)
 
             robot.send_action(action)
 
-            # Record what we commanded and what the robot actually did this tick.
-            kin = robot.robot_manager.current_kinematic_state_batch(list(arms))
-            meas = robot.current_ee_pose_env()
+            # Record both action representations and the measured EE/joint state
+            # this tick (state is from the tick-start snapshot).
             timestamps.append(t0 - t_start)
             for arm in arms:
                 q = kin[arm][0]  # snapshot is (q, dq, O_T_EE, twist)
-                m_pos, m_quat = meas[arm]
-                log[arm]["target_pos"].append([action[f"{arm}_{k}"] for k in ("x", "y", "z")])
+                m_pos, m_quat = ee_now[arm]
+                target_pos = np.array([action[f"{arm}_{k}"] for k in ("x", "y", "z")])
+                # Relative action: per-step delta from measured pose to the circle.
+                delta_pos = target_pos - np.asarray(m_pos, dtype=np.float64)
+                log[arm]["delta_pos"].append(delta_pos)
+                log[arm]["target_pos"].append(target_pos)
                 log[arm]["target_quat"].append([action[f"{arm}_{k}"] for k in ("qx", "qy", "qz", "qw")])
                 log[arm]["meas_pos"].append(np.asarray(m_pos, dtype=np.float64))
                 log[arm]["meas_quat"].append(np.asarray(m_quat, dtype=np.float64))
