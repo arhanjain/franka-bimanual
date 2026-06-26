@@ -1,0 +1,3 @@
+lerobot
+PyGObject<3.52
+opencv-python-headless

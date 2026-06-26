@@ -29,12 +29,15 @@ $ python scripts/home.py apply home_pose --arm r
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Literal, Optional, Union
 
 import numpy as np
+import tyro
+from typing_extensions import Annotated
 
 from lerobot_robot_envframe_franka import EnvFrameFranka, EnvFrameFrankaConfig
 
@@ -65,11 +68,12 @@ _RIG = dict(
 )
 
 
-def _make_robot(args: argparse.Namespace, arms: tuple[str, ...]) -> EnvFrameFranka:
+def _make_robot(args: Any, arms: tuple[str, ...]) -> EnvFrameFranka:
     cfg = EnvFrameFrankaConfig(
         l_server_ip=args.l_server_ip, l_robot_ip=args.l_robot_ip, l_port=args.l_port,
         r_server_ip=args.r_server_ip, r_robot_ip=args.r_robot_ip, r_port=args.r_port,
         active_arms=arms,
+        enable_cameras=False,  # pose-only; no vision needed for homing
     )
     return EnvFrameFranka(cfg)
 
@@ -78,7 +82,7 @@ def _path_for(name: str) -> Path:
     return POSES_DIR / f"{name}.json"
 
 
-def cmd_save(args: argparse.Namespace) -> None:
+def cmd_save(args: Any) -> None:
     path = _path_for(args.name)
     # --mirror connects only the reference arm; otherwise connect the --arm set.
     connect_arms = (args.mirror,) if args.mirror else tuple(args.arm)
@@ -112,7 +116,7 @@ def cmd_save(args: argparse.Namespace) -> None:
         robot.disconnect()
 
 
-def cmd_apply(args: argparse.Namespace) -> None:
+def cmd_apply(args: Any) -> None:
     path = _path_for(args.name)
     if path.exists():
         pose = json.loads(path.read_text())
@@ -133,7 +137,7 @@ def cmd_apply(args: argparse.Namespace) -> None:
         robot.disconnect()
 
 
-def cmd_list(_: argparse.Namespace) -> None:
+def cmd_list(_: Any) -> None:
     if not POSES_DIR.exists():
         print(f"(no poses saved yet; {POSES_DIR} doesn't exist)")
         return
@@ -145,41 +149,65 @@ def cmd_list(_: argparse.Namespace) -> None:
         print(n)
 
 
+@dataclass
+class Save:
+    """Read and save the current joint pose."""
+
+    name: tyro.conf.Positional[str]
+    """Pose name (stored as home_poses/NAME.json)"""
+    arm: Literal["l", "r", "lr"] = "lr"
+    """Which arm(s) to connect and home. Default: both."""
+    mirror: Optional[Literal["l", "r"]] = None
+    """Read only this arm and write BOTH (other = its mirror)."""
+    l_server_ip: str = _RIG["l_server_ip"]
+    l_robot_ip: str = _RIG["l_robot_ip"]
+    l_port: int = _RIG["l_port"]
+    r_server_ip: str = _RIG["r_server_ip"]
+    r_robot_ip: str = _RIG["r_robot_ip"]
+    r_port: int = _RIG["r_port"]
+
+
+@dataclass
+class Apply:
+    """Drive the arms to a saved joint pose."""
+
+    name: tyro.conf.Positional[str]
+    """Pose name"""
+    arm: Literal["l", "r", "lr"] = "lr"
+    """Which arm(s) to connect and home. Default: both."""
+    max_time_s: float = 10.0
+    fps: float = 30.0
+    tol_rad: float = 0.02
+    l_server_ip: str = _RIG["l_server_ip"]
+    l_robot_ip: str = _RIG["l_robot_ip"]
+    l_port: int = _RIG["l_port"]
+    r_server_ip: str = _RIG["r_server_ip"]
+    r_robot_ip: str = _RIG["r_robot_ip"]
+    r_port: int = _RIG["r_port"]
+
+
+@dataclass
+class List:
+    """List saved pose names."""
+
+
+Cmd = Union[
+    Annotated[Save, tyro.conf.subcommand("save")],
+    Annotated[Apply, tyro.conf.subcommand("apply")],
+    Annotated[List, tyro.conf.subcommand("list")],
+]
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-
-    rig = argparse.ArgumentParser(add_help=False)
-    rig.add_argument("--l-server-ip", default=_RIG["l_server_ip"])
-    rig.add_argument("--l-robot-ip", default=_RIG["l_robot_ip"])
-    rig.add_argument("--l-port", type=int, default=_RIG["l_port"])
-    rig.add_argument("--r-server-ip", default=_RIG["r_server_ip"])
-    rig.add_argument("--r-robot-ip", default=_RIG["r_robot_ip"])
-    rig.add_argument("--r-port", type=int, default=_RIG["r_port"])
-    rig.add_argument("--arm", choices=("l", "r", "lr"), default="lr",
-                     help="Which arm(s) to connect and home. Default: both.")
-
-    sub = p.add_subparsers(dest="cmd", required=True)
-
-    sp_save = sub.add_parser("save", parents=[rig], help="Read and save the current joint pose")
-    sp_save.add_argument("name", help="Pose name (stored as home_poses/NAME.json)")
-    sp_save.add_argument("--mirror", choices=("l", "r"), default=None,
-                         help="Read only this arm and write BOTH (other = its mirror).")
-    sp_save.set_defaults(func=cmd_save)
-
-    sp_apply = sub.add_parser("apply", parents=[rig], help="Drive the arms to a saved joint pose")
-    sp_apply.add_argument("name", help="Pose name")
-    sp_apply.add_argument("--max-time-s", type=float, default=10.0)
-    sp_apply.add_argument("--fps", type=float, default=30.0)
-    sp_apply.add_argument("--tol-rad", type=float, default=0.02)
-    sp_apply.set_defaults(func=cmd_apply)
-
-    sp_list = sub.add_parser("list", help="List saved pose names")
-    sp_list.set_defaults(func=cmd_list)
-
-    args = p.parse_args()
-    args.func(args)
+    cmd = tyro.cli(Cmd, description=__doc__)
+    if isinstance(cmd, Save):
+        cmd_save(cmd)
+    elif isinstance(cmd, Apply):
+        cmd_apply(cmd)
+    elif isinstance(cmd, List):
+        cmd_list(cmd)
 
 
 if __name__ == "__main__":

@@ -15,10 +15,10 @@ name = "franka-bimanual"
 version = "0.1.0"
 description = "Bimanual Franka FR3 real-world control stack — LeRobot plugin workspace for the TRI rig."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
+    "lerobot>=0.5.0",
     # LeRobot core (the CLIs: lerobot-teleoperate/-record/-replay/-train).
-    "lerobot[all]",
     # Workspace members (resolved locally via [tool.uv.sources]).
     "lerobot_camera_arv",
     "lerobot_camera_framos",
@@ -32,34 +32,46 @@ dependencies = [
     "pyspacemouse>=2.0",
     "dynamixel-sdk>=3.8",
     "scipy",
-    "opencv-python-headless",
+    "tyro",
+    # Full opencv-python (NOT -headless): the live camera grid uses cv2 highgui
+    # (namedWindow/imshow). lerobot and the camera plugin packages pin
+    # opencv-python-headless, which compiles OUT highgui; the override below drops
+    # headless so only this GUI-enabled build provides cv2 (a superset, so nothing
+    # that imports cv2 breaks).
+    "opencv-python",
     "open3d>=0.19.0",
+    "pyrealsense2",
     # NOTE: pyrealsense2 is intentionally NOT listed. The D415e needs the
     # FRAMOS-built binding (v2.55), compiled from ~/librealsense2 and installed
     # with `uv pip install --no-build-isolation ~/librealsense2/wrappers/python/`.
     # Listing it here would let `uv sync` reinstall the wrong PyPI wheel over it.
+    "openpi-client",
+    "mediapy>=1.2.6",
 ]
 
 # The repo root is not itself an importable package — just the workspace anchor.
 [tool.uv]
 package = false
-
-[tool.uv.workspace]
-members = [
-    "lerobot_camera_arv",
-    "lerobot_camera_framos",
-    "lerobot_robot_bimanual_franka",
-    "lerobot_robot_envframe_franka",
-    "lerobot_teleoperator_gello",
-    "lerobot_teleoperator_spacemouse",
-]
+no-build-isolation-package = ["pyrealsense2"]
+# Drop opencv-python-headless everywhere it is pinned (lerobot + the camera
+# plugin packages). It and the full opencv-python both provide the `cv2`
+# module and overwrite each other in site-packages; headless compiles out
+# highgui, so whichever lands last decides whether the camera grid's
+# namedWindow/imshow work. The impossible marker removes headless from
+# resolution so only the full opencv-python (declared above) installs.
+override-dependencies = [
+    "opencv-python-headless; sys_platform == 'nonexistent'",
+    "numpy>=2.0",
+    ]
 
 # Resolve intra-repo deps (e.g. bimanual_franka -> camera_arv/camera_framos)
 # from the workspace instead of an index.
 [tool.uv.sources]
-lerobot_camera_arv = { workspace = true }
-lerobot_camera_framos = { workspace = true }
-lerobot_robot_bimanual_franka = { workspace = true }
-lerobot_robot_envframe_franka = { workspace = true }
-lerobot_teleoperator_gello = { workspace = true }
-lerobot_teleoperator_spacemouse = { workspace = true }
+lerobot_camera_arv = { path = "src/lerobot_camera_arv", editable = true }
+lerobot_camera_framos = { path = "src/lerobot_camera_framos", editable = true  }
+lerobot_robot_bimanual_franka = { path = "src/lerobot_robot_bimanual_franka", editable = true  }
+lerobot_robot_envframe_franka = { path = "src/lerobot_robot_envframe_franka", editable = true  }
+lerobot_teleoperator_gello = { path = "src/lerobot_teleoperator_gello", editable = true }
+lerobot_teleoperator_spacemouse = { path = "src/lerobot_teleoperator_spacemouse", editable = true  }
+pyrealsense2 = { path = "/home/qirico/librealsense2/wrappers/python"}
+openpi-client = { git = "https://github.com/Physical-Intelligence/openpi.git", subdirectory = "packages/openpi-client", branch = "main" }

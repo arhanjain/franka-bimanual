@@ -134,6 +134,59 @@ Camera frames are 224×224 RGB by default and exposed in the observation under
 `cam_1` … `cam_6`. Camera failures degrade to `blank_frame()` (last known
 image) rather than raising.
 
+## Env-frame stack — `lerobot_robot_envframe_franka`
+
+A separate, minimal `Robot` (`EnvFrameFranka`) whose action/observation is the
+**absolute EE pose in the sim env frame** only (no grippers, no cameras), keyed
+`{arm}_{x,y,z,qx,qy,qz,qw}` (quaternion xyzw). `l`/`r` are keyed by side
+(`l`=mario=env −y=sim `left_panda`, `r`=luigi=env +y=sim `right_panda`); per-arm
+base-in-env mounting transforms live in `EnvFrameFrankaConfig.base_in_env`. The
+direct-RPyC bridge ([franka_link.py](lerobot_robot_envframe_franka/lerobot_robot_envframe_franka/franka_link.py))
+is the same pattern as `franka_process.py` but trimmed (no grippers).
+
+`config.control_mode` selects the actuation path for the *same* pose action:
+
+- **`joint_ik`** (DEFAULT): a workstation resolved-rate loop that tracks sim's
+  DLS-IK redundancy resolution, so the joint-space trajectory matches sim.
+  `send_action` (≈10 Hz) only stores the held base-frame target pose; a
+  background thread runs at `config.ik_hz` (default 100 Hz) and per tick:
+  reads `(q, O_T_EE)`, **builds the base-frame geometric Jacobian from `q`
+  itself** (see `franka_jacobian.py`), forms the axis-angle pose error `dx`, and
+  commands a joint **velocity** `dq = clip(DLS(J, cart_gain·dx), ±max_joint_vel)`
+  via `JointVelocityMotion`. The DLS pinv is sim's exact `Jᵀ(JJᵀ+λ²I)⁻¹`
+  (λ=`dls_lambda`=0.01). Two gotchas, both learned on hardware:
+  - franky's `model.zero_jacobian` returns **all zeros** on this net_franky
+    build — hence the analytic Jacobian (validated == finite-difference of the
+    repo FK). Only `(q, O_T_EE)` cross the wire.
+  - It must be a joint *velocity* stream, not a streamed joint-position target:
+    `CBRobot.move()` runs every motion through franky's controller and bare
+    `JointMotion` is a point-to-point Ruckig move with **no validity window**, so
+    streaming it at 100 Hz trips "multiple motions" every tick, nothing holds
+    the arm, and it **sags**. A velocity motion's 100 ms window holds at
+    convergence (zero-vel).
+  **Gains to tune:** `cart_gain` (loop gain, 1/s — the divergence from sim;
+  start 4, raise until just before it rings/gets springy) and `joint_stiffness`
+  (FR3 internal tracker, default sim's 400 N·m/rad). This is *kinematically*
+  sim-faithful but the closed-loop *bandwidth* is `cart_gain`-dependent, not
+  sim's one-shot-step-into-Kp=400-PD; an exact dynamics match needs the
+  pylibfranka-on-NUC path. Each `RobotDriver` serializes its RPyC connection
+  with a lock (the IK thread and `get_observation` race the same connection);
+  each tick is two round-trips/arm (`get_state_jac` read → `send_jv`). The
+  DLS-IK math is vendored bit-faithful from `nuc_server/diffik.py` into
+  [diffik.py](lerobot_robot_envframe_franka/lerobot_robot_envframe_franka/diffik.py)
+  (keep the two in sync).
+- **`twist`** (`--twist`): legacy path. `send_action` tracks the target with a
+  Cartesian-velocity PD twist (`EE_PD_KP=2.0`, `EE_PD_KD=0.1`, clamps 0.30 m/s /
+  1.20 rad/s) streamed as `CartesianVelocityMotion`; libfranka's internal IK
+  resolves redundancy (so the joint trajectory does NOT match sim).
+
+All `send_action` scripts (`circle_trajectory.py`, `spacemouse_teleop.py`,
+`replay_sim_traj.py`, `misc/env_jog.py`) default to `joint_ik`; pass `--twist`
+for the legacy path. `home()` (joint-velocity PD to a saved JP target) is shared
+by both modes; the IK velocity stream is stopped on `disconnect()`. Do NOT call
+`stop_all_motion()` (Cartesian stop) mid-run in joint_ik — it clashes with the
+joint-velocity stream; let `disconnect()` tear down.
+
 ## Teleop stack
 
 Three leaders, all emitting the **same `l_` / `r_` key prefixes** the follower

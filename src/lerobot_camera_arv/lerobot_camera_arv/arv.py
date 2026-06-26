@@ -1,0 +1,371 @@
+"""Minimal Aravis camera wrapper for Ethernet GigE cameras."""
+
+from __future__ import annotations
+
+import logging
+import time
+from typing import Any
+
+import cv2
+import gi
+import numpy as np
+from numpy.typing import NDArray
+
+gi.require_version("Aravis", "0.8")
+from gi.repository import Aravis  # type: ignore[attr-defined]
+
+from lerobot.cameras.camera import Camera
+from lerobot.cameras.configs import CameraConfig  # noqa: F401 - re-exported for callers
+
+from .config_arv import ArvCameraConfig
+
+logger = logging.getLogger(__name__)
+
+DOWNSCALE_FACTOR = 8
+
+BUFFER_RING_SIZE = 4
+
+
+def _payload_bytes(width: int, height: int, pixel_format: str) -> int:
+    """Minimal raw image size in bytes (no GigE Vision chunk/metadata)."""
+
+    def _dims() -> int:
+        return int(width) * int(height)
+
+    pf = pixel_format
+    if pf == "Mono16":
+        return _dims() * 2
+    if pf.endswith("Packed") and pf != "Mono16":
+        return -1
+    if pf.startswith("Mono") or pf.startswith("Bayer"):
+        return _dims()
+    if pf == "RGB8":
+        return _dims() * 3
+    return -1
+
+
+_BAYER_TO_RGB: dict[str, int] = {
+    # "BayerBG8": cv2.COLOR_BAYER_BG2RGB,
+    # "BayerGB8": cv2.COLOR_BAYER_GB2RGB,
+    # "BayerGR8": cv2.COLOR_BAYER_GR2RGB,
+    "BayerRG8": cv2.COLOR_BAYER_BG2RGB,
+    # "BayerBG10": cv2.COLOR_BAYER_BG2RGB,
+    # "BayerGB10": cv2.COLOR_BAYER_GB2RGB,
+    # "BayerGR10": cv2.COLOR_BAYER_GR2RGB,
+    # "BayerRG10": cv2.COLOR_BAYER_RG2RGB,
+    # "BayerBG12": cv2.COLOR_BAYER_BG2RGB,
+    # "BayerGB12": cv2.COLOR_BAYER_GB2RGB,
+    # "BayerGR12": cv2.COLOR_BAYER_GR2RGB,
+    # "BayerRG12": cv2.COLOR_BAYER_RG2RGB,
+}
+
+
+class ArvCamera(Camera):
+    def __init__(self, config: ArvCameraConfig):
+        super().__init__(config)
+        self._config = config
+        self._name = config.name
+        self._ip = config.ip
+        self._pixel_format = config.pixel_format
+        self._width = int(config.width) if config.width is not None else 0
+        self._height = int(config.height) if config.height is not None else 0
+
+        self._camera: Aravis.Camera | None = None
+        self._stream: Aravis.Stream | None = None
+        self._payload: int = 0
+        self._last_frame: np.ndarray | None = None
+
+        # Rolling FPS diagnostics — logs measured rate every 100 frames.
+        self._fps_times: list[float] = []
+        self._fps_log_interval: int = 100
+
+        # Capture (sensor-region) size. Pre-connect we default to output x
+        # DOWNSCALE_FACTOR; connect() refines this against the real sensor bounds
+        # via _resolve_capture_size so the requested region always FITS the panel
+        # (output*8 can overflow -- e.g. 960*8=7680 -- which makes the camera
+        # return garbage). See _resolve_capture_size.
+        self._sensor_width: int = self._width * DOWNSCALE_FACTOR
+        self._sensor_height: int = self._height * DOWNSCALE_FACTOR
+
+    @property
+    def is_connected(self) -> bool:
+        return self._camera is not None and self._stream is not None
+
+    @staticmethod
+    def find_cameras() -> list[dict[str, Any]]:
+        raise NotImplementedError("Don't use find cameras here")
+
+    def connect(self, warmup: bool = True) -> None:
+        self.disconnect()
+        device = Aravis.open_device(self._ip)
+        camera = Aravis.Camera.new_with_device(device)
+        self._configure_camera(camera)
+
+        stream = camera.create_stream(None, None)
+        payload = int(camera.get_payload())
+        for _ in range(BUFFER_RING_SIZE):
+            stream.push_buffer(Aravis.Buffer.new_allocate(payload))
+
+        camera.start_acquisition()
+
+        self._camera = camera
+        self._stream = stream
+        self._payload = payload
+        self._pixel_format = self._safe_get_string(camera, "PixelFormat", "Mono8")
+        self._last_frame = self.read()
+        logger.info(
+            "Connected camera %s @ %s (%s)",
+            self._name,
+            self._ip,
+            self._pixel_format,
+        )
+
+    def read(self) -> NDArray[Any]:
+        return self._fetch_frame(timeout_s=1.0, allow_stale=False)
+
+    def async_read(self, timeout_ms: float = 500) -> NDArray[Any]:
+        return self._fetch_frame(timeout_s=timeout_ms / 1000.0, allow_stale=True)
+
+    def disconnect(self) -> None:
+        if self._camera is not None:
+            try:
+                self._camera.stop_acquisition()
+            except Exception:
+                logger.debug("Failed stopping camera %s %s", self._name, self._ip, exc_info=True)
+        self._camera = None
+        self._stream = None
+        self._payload = 0
+
+    def blank_frame(self) -> np.ndarray:
+        if self._last_frame is not None:
+            return self._last_frame.copy()
+        return np.zeros((self._height, self._width, 3), dtype=np.uint8)
+
+    def _fetch_frame(self, timeout_s: float, allow_stale: bool) -> np.ndarray:
+        """Fetch the most-recent frame, mirroring FramosCamera._fetch_color().
+
+        Aravis buffers form a FIFO: without draining, the consumer always reads
+        the *oldest* queued frame, which can lag seconds behind reality when the
+        ring fills up.  After blocking until at least one frame arrives we drain
+        every additional ready buffer (recycling them back to the camera) so the
+        frame we decode is always the freshest — exactly what the RealSense
+        pipeline.wait_for_frames() does internally for the FRAMOS cameras.
+        """
+        if self._stream is None:
+            return self.blank_frame()
+
+        # Block until the first frame is ready (or timeout elapses).
+        timeout_us = max(1, int(timeout_s * 1_000_000))
+        buffer = self._stream.timeout_pop_buffer(timeout_us)
+
+        if buffer is None:
+            if self._last_frame is not None:
+                return self._last_frame.copy()
+            if allow_stale:
+                return self.blank_frame()
+            raise TimeoutError(
+                f"Timed out reading camera {self._name} ({self._config.ip})."
+            )
+
+        # Drain any frames that queued up while we were busy elsewhere so we
+        # always deliver the freshest image, not one from seconds ago.
+        dropped = 0
+        max_drain = 65536
+        while dropped < max_drain:
+            newer = self._stream.try_pop_buffer()
+            if newer is None:
+                break
+            self._stream.push_buffer(buffer)  # recycle the older frame
+            buffer = newer
+            dropped += 1
+        if dropped >= max_drain:
+            logger.warning(
+                "%s @ %s: drained %d buffers (hit cap); possible driver issue",
+                self._name,
+                self._ip,
+                max_drain,
+            )
+        if dropped:
+            logger.debug("%s: drained %d stale frame(s) to stay current", self._name, dropped)
+
+        try:
+            if buffer.get_status() == Aravis.BufferStatus.SUCCESS:
+                try:
+                    frame = self._buffer_to_rgb(buffer)
+                except ValueError as exc:
+                    # Truncated / padded GigE payload — fall back to last known.
+                    logger.debug("Dropped frame %s @ %s: %s", self._name, self._ip, exc)
+                else:
+                    self._last_frame = frame
+                    self._record_fps()
+                    return frame.copy()
+        finally:
+            self._stream.push_buffer(buffer)
+
+        if self._last_frame is not None:
+            return self._last_frame.copy()
+        if allow_stale:
+            return self.blank_frame()
+        raise TimeoutError(
+            f"Camera {self._name} ({self._config.ip}): frame had non-SUCCESS status."
+        )
+
+    def _buffer_to_rgb(self, buffer: Aravis.Buffer) -> np.ndarray:
+        if self._camera is None:
+            return self.blank_frame()
+        # Use the camera's actual sensor dimensions when decoding the
+        # incoming buffer so we keep the full frame (no camera-side crop).
+        width = int(self._safe_get_int(self._camera, "Width", self._sensor_width))
+        height = int(self._safe_get_int(self._camera, "Height", self._sensor_height))
+        data = buffer.get_data()
+        nbytes = len(data)
+        raw_expect = _payload_bytes(width, height, self._pixel_format)
+        if raw_expect > 0 and nbytes != raw_expect:
+            if nbytes < raw_expect:
+                raise ValueError(
+                    f"incomplete GigE payload: {nbytes} < {raw_expect} bytes "
+                    f"for {width}x{height} {self._pixel_format}"
+                )
+            data = bytes(data[:raw_expect])
+        elif self._payload and nbytes != self._payload and raw_expect < 0:
+            if nbytes < self._payload:
+                raise ValueError(
+                    f"short buffer ({nbytes} < payload {self._payload}): {width}x{height} {self._pixel_format}"
+                )
+
+        frame = self._decode_frame(data, width, height, self._pixel_format)
+
+        # If the requested output size differs from the sensor size, downsample
+        # in software (preserve the full frame then resize). This avoids camera
+        # ROI/cropping behavior on the device.
+        if (self._height and self._width) and (
+            frame.shape[0] != self._height or frame.shape[1] != self._width
+        ):
+            frame = cv2.resize(frame, (self._width, self._height), interpolation=cv2.INTER_AREA)
+        return np.ascontiguousarray(frame)
+
+    def _configure_camera(self, camera: Aravis.Camera) -> None:
+        try:
+            camera.gv_set_packet_size(1400)
+        except Exception:
+            logger.debug("Could not set packet size on %s %s", self._name, self._ip, exc_info=True)
+
+        camera.set_acquisition_mode(Aravis.AcquisitionMode.CONTINUOUS)
+        self._resolve_capture_size(camera)
+        self._safe_set_int(camera, "Width", self._sensor_width)
+        self._safe_set_int(camera, "Height", self._sensor_height)
+        if self._config.fps is not None:
+            # Some GigE cameras gate the FPS register behind a separate enable
+            # boolean; set it first so the rate write actually takes effect.
+            self._safe_set_bool(camera, "AcquisitionFrameRateEnable", True)
+            self._safe_set_float(camera, "AcquisitionFrameRate", float(self._config.fps))
+
+    def _resolve_capture_size(self, camera: Aravis.Camera) -> None:
+        """Pick the capture (sensor-region) size = output * factor, choosing the
+        largest integer factor (<= DOWNSCALE_FACTOR) that fits the sensor on BOTH
+        axes, then INTER_AREA-downscale to the output in software.
+
+        A fixed *8 overflows the panel for larger outputs (960*8=7680 > sensor),
+        which makes the camera return garbage. Shrinking the factor keeps the
+        oversample-then-downscale FoV benefit while always fitting: 224 stays *8
+        (1792), 960 drops to *2 (1920) on a 1920/2048-wide panel. Factor 1 means
+        capture at the output size directly (a crop, if even that doesn't fit)."""
+        if not (self._width and self._height):
+            return
+        # Sensor max width/height (WidthMax/HeightMax reflect the current ROI's
+        # room; SensorWidth/Height is the full panel -- prefer the larger).
+        max_w = max(self._safe_get_int(camera, "WidthMax", 0),
+                    self._safe_get_int(camera, "SensorWidth", 0))
+        max_h = max(self._safe_get_int(camera, "HeightMax", 0),
+                    self._safe_get_int(camera, "SensorHeight", 0))
+        if max_w <= 0 or max_h <= 0:
+            return  # sensor bounds unknown; keep the *8 default and let it clamp
+
+        factor = DOWNSCALE_FACTOR
+        while factor > 1 and (self._width * factor > max_w or self._height * factor > max_h):
+            factor -= 1
+        self._sensor_width = self._width * factor
+        self._sensor_height = self._height * factor
+        if factor != DOWNSCALE_FACTOR:
+            logger.info(
+                "%s @ %s: capture %dx%d (downscale x%d, not x%d) to fit sensor %dx%d",
+                self._name, self._ip, self._sensor_width, self._sensor_height,
+                factor, DOWNSCALE_FACTOR, max_w, max_h,
+            )
+
+    def _decode_frame(self, data: bytes, width: int, height: int, pixel_format: str) -> np.ndarray:
+        if pixel_format == "Mono16":
+            frame = np.frombuffer(data, dtype=np.uint16).reshape((height, width))
+            frame = (frame >> 8).astype(np.uint8)
+            return cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+
+        if pixel_format in _BAYER_TO_RGB:
+            mono = np.frombuffer(data, dtype=np.uint8).reshape((height, width))
+            return cv2.cvtColor(mono, _BAYER_TO_RGB[pixel_format])
+
+        if pixel_format == "RGB8":
+            frame = np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3))
+            return frame
+
+        if pixel_format == "Mono8":
+            mono = np.frombuffer(data, dtype=np.uint8).reshape((height, width))
+            return cv2.cvtColor(mono, cv2.COLOR_GRAY2RGB)
+
+        # Fallback: best effort as mono8 to keep observation keys stable.
+        try:
+            mono = np.frombuffer(data, dtype=np.uint8).reshape((height, width))
+            return cv2.cvtColor(mono, cv2.COLOR_GRAY2RGB)
+        except Exception as exc:
+            raise ValueError(f"Unsupported pixel format {pixel_format} on {self._name}") from exc
+
+    def _record_fps(self) -> None:
+        """Track inter-frame timestamps and log measured FPS periodically."""
+        now = time.monotonic()
+        self._fps_times.append(now)
+        if len(self._fps_times) >= self._fps_log_interval:
+            elapsed = self._fps_times[-1] - self._fps_times[0]
+            if elapsed > 0:
+                measured = (len(self._fps_times) - 1) / elapsed
+                logger.debug(
+                    "ARV %s @ %s: measured %.2f fps over last %d frames",
+                    self._name,
+                    self._ip,
+                    measured,
+                    len(self._fps_times) - 1,
+                )
+            self._fps_times = self._fps_times[-10:]  # keep a short tail for continuity
+
+    @staticmethod
+    def _safe_set_bool(camera: Aravis.Camera, key: str, value: bool) -> None:
+        try:
+            camera.set_boolean(key, value)
+        except Exception:
+            logger.debug("Could not set %s=%s", key, value, exc_info=True)
+
+    @staticmethod
+    def _safe_set_int(camera: Aravis.Camera, key: str, value: int) -> None:
+        try:
+            camera.set_integer(key, int(value))
+        except Exception:
+            logger.debug("Could not set %s=%s", key, value, exc_info=True)
+
+    @staticmethod
+    def _safe_set_float(camera: Aravis.Camera, key: str, value: float) -> None:
+        try:
+            camera.set_float(key, float(value))
+        except Exception:
+            logger.debug("Could not set %s=%s", key, value, exc_info=True)
+
+    @staticmethod
+    def _safe_get_int(camera: Aravis.Camera, key: str, default: int) -> int:
+        try:
+            return int(camera.get_integer(key))
+        except Exception:
+            return default
+
+    @staticmethod
+    def _safe_get_string(camera: Aravis.Camera, key: str, default: str) -> str:
+        try:
+            return str(camera.get_string(key))
+        except Exception:
+            return default
