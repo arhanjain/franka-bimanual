@@ -30,8 +30,9 @@ header added by ``visualize_reset_states.py``.  Generate a default render when
 using this tool.
 
 Usage:
+
 .venv/bin/python scripts/overlay_sim_render.py \
-  --sim-image /home/qirico/qirico/sim-improvement-aug26/experiments/dataset_generation/sim_render_1.png
+  --sim-image /home/qirico/qirico/sim-improvement-aug26/experiments/dataset_generation/resets/sim_render_1.png
 """
 
 from __future__ import annotations

@@ -43,7 +43,7 @@ from cv2 import aruco
 from calib_common import (
     CHARUCO_SQUARES, CHARUCO_SQUARE_SIZE,
     charuco_match_env, detect_charuco, invT, load_results, quat_wxyz_from_R,
-    samples_dir, save_results, T_from,
+    samples_dir, save_results, T_from, fit_opencv_fisheye_to_isaac_sim_polynomial,
 )
 from lerobot_robot_envframe_franka import EnvFrameFranka, EnvFrameFrankaConfig
 from lerobot_robot_envframe_franka.diffik import (
@@ -126,13 +126,13 @@ HOME_Q = HOME_Q_BY_ARM[ARM]
 # RIGHT-arm trajectory params. The LEFT arm mirrors these across the env x-axis
 # (y -> -y on AIM_POINT and CENTER_XY); main() applies the mirror per --arm.
 # Point the EE +Z (wrist-cam optical axis) at this env-frame point every tick.
-AIM_POINT = np.array([-0.2, 0.4, 0.0])
+AIM_POINT = np.array([-0.05, 0.05, 0.0])
 # Env-frame xy center (meters) the circles are traced around (shared by all z
 # levels). Set to None to use the measured home EE xy instead.
-CENTER_XY = (-0.1, 0.2)
+CENTER_XY = (-0.05, 0.2)
 
 # Env-frame z heights (meters) to run one circle at, in order. One circle per z.
-Z_LEVELS = (0.55, 0.45, 0.35)
+Z_LEVELS = (0.55, 0.45, 0.4)
 
 # Circle in the env xy-plane around CENTER_XY.
 RADIUS = 0.1      # meters
@@ -589,10 +589,22 @@ def _overlay_env_axes(mtx, dist, env_T_base, cam_in_ee, used_images, gripper_T_b
         cam_T_env = cam_T_gripper @ g_T_b @ base_T_env
         rvec, _ = cv.Rodrigues(cam_T_env[:3, :3])
         tvec = cam_T_env[:3, 3]
+        # drawFrameAxes only understands OpenCV's pinhole distortion model.
+        # Project the same origin/X/Y/Z points with the calibrated fisheye model
+        # and draw the axes ourselves, so this verification uses the identical
+        # projection model as the intrinsic solve.
+        axis_points = np.array(
+            [[0.0, 0.0, 0.0], [L, 0.0, 0.0], [0.0, L, 0.0], [0.0, 0.0, L]],
+            dtype=np.float64,
+        ).reshape(-1, 1, 3)
         try:
-            cv.drawFrameAxes(img, mtx, dist, rvec, tvec, L, 3)
+            projected, _ = cv.fisheye.projectPoints(axis_points, rvec, tvec, mtx, dist)
         except cv.error:
             continue
+        origin, x_axis, y_axis, z_axis = np.rint(projected.reshape(-1, 2)).astype(int)
+        cv.line(img, tuple(origin), tuple(x_axis), (0, 0, 255), 3, cv.LINE_AA)
+        cv.line(img, tuple(origin), tuple(y_axis), (0, 255, 0), 3, cv.LINE_AA)
+        cv.line(img, tuple(origin), tuple(z_axis), (255, 0, 0), 3, cv.LINE_AA)
         stem = os.path.splitext(name)[0]
         cv.imwrite(os.path.join(OUT_DIR, f"{stem}_axes.png"), img)
 
@@ -605,7 +617,7 @@ def solve_handeye(records: list[dict], image_size: tuple[int, int]) -> dict | No
       X = base_T_board   (robot world->board ... i.e. board pose in the base)
       Z = cam_T_gripper  (=> cam_in_ee = inv)
     using
-      A = cam_T_board   from calibrateCamera on ChArUco corners (board->cam)
+      A = cam_T_board   from fisheye calibration on ChArUco corners (board->cam)
       B = gripper_T_base = inv(O_T_EE)             (O_T_EE is gripper-in-base)
 
     The board is laid X-forward / Z-up aligned with the ENV frame, and we want
@@ -645,9 +657,42 @@ def solve_handeye(records: list[dict], image_size: tuple[int, int]) -> dict | No
         return None
 
     # Intrinsics + per-view cam_T_env pose (A). Object points are in the env
-    # frame, so calibrateCamera's rvecs/tvecs ARE env->cam (cam_T_env) directly.
-    rms, mtx, dist, rvecs, tvecs = cv.calibrateCamera(obj_pts, img_pts, image_size, None, None)
-    logger.info("wrist intrinsics (charuco): %d view(s), reproj RMS %.3f px", n, rms)
+    # frame, so fisheye.calibrate's rvecs/tvecs ARE env->cam (cam_T_env) directly.
+    # The wide-angle wrist lenses are fit with OpenCV's theta-polynomial
+    # fisheye model. Extending a pinhole Brown--Conrady polynomial into the
+    # image periphery can make it non-invertible and fold render regions.
+    # fisheye.calibrate requires one Nx1x3/Nx1x2 float64 array per view.
+    fisheye_obj_pts = [points.reshape(-1, 1, 3).astype(np.float64) for points in obj_pts]
+    fisheye_img_pts = [points.reshape(-1, 1, 2).astype(np.float64) for points in img_pts]
+    fisheye_flags = cv.fisheye.CALIB_RECOMPUTE_EXTRINSIC | cv.fisheye.CALIB_FIX_SKEW
+    fisheye_criteria = (
+        cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_MAX_ITER,
+        100,
+        1e-8,
+    )
+    rms, mtx, dist, rvecs, tvecs = cv.fisheye.calibrate(
+        fisheye_obj_pts,
+        fisheye_img_pts,
+        image_size,
+        np.eye(3, dtype=np.float64),
+        np.zeros((4, 1), dtype=np.float64),
+        flags=fisheye_flags,
+        criteria=fisheye_criteria,
+    )
+    logger.info("wrist intrinsics (charuco fisheye): %d view(s), reproj RMS %.3f px", n, rms)
+    isaac_sim_fisheye = fit_opencv_fisheye_to_isaac_sim_polynomial(
+        mtx,
+        dist,
+        image_size,
+        image_points=np.concatenate(img_pts, axis=0),
+    )
+    logger.info(
+        "Isaac Sim full-sensor f-theta fit: FOV %.1f deg, source RMS %.3f px, max %.3f px (%s).",
+        isaac_sim_fisheye["fisheye_max_fov"],
+        isaac_sim_fisheye["fit_rms_px"],
+        isaac_sim_fisheye["fit_max_px"],
+        isaac_sim_fisheye["fit_domain_source"],
+    )
 
     R_board2cam = [cv.Rodrigues(r)[0] for r in rvecs]
     t_board2cam = [t.ravel() for t in tvecs]
@@ -689,12 +734,17 @@ def solve_handeye(records: list[dict], image_size: tuple[int, int]) -> dict | No
     return {
         "image_size": [int(image_size[0]), int(image_size[1])],
         "intrinsics": {
-            "source": "charuco_calibrateCamera",
+            "source": "charuco_fisheye_calibrate",
+            "model": "opencv_fisheye",
             "matrix": mtx.tolist(),
             "distortion": dist.ravel().tolist(),
+            "distortion_order": ["k1", "k2", "k3", "k4"],
             "reproj_rms_px": float(rms),
             "n_views": n,
         },
+        # Ready to paste into Isaac Sim's legacy FisheyeCameraCfg. The source
+        # OpenCV fisheye coefficients use a different radial parameterization.
+        "isaac_sim_fisheye_polynomial": isaac_sim_fisheye,
         "handeye": {
             "method": "shah",
             "n_views": n,
