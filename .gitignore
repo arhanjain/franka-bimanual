@@ -2,3 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+scripts/calibration/samples/wrist_left_plus
+scripts/calibration/samples/scene_left_0
+scripts/calibration/samples/scene_right_0
+scripts/calibration/samples/wrist_right_minus

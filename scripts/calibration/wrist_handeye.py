@@ -27,7 +27,9 @@ import json
 import logging
 import os
 import signal
+import sys
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Literal
 
@@ -44,6 +46,13 @@ from calib_common import (
     samples_dir, save_results, T_from,
 )
 from lerobot_robot_envframe_franka import EnvFrameFranka, EnvFrameFrankaConfig
+from lerobot_robot_envframe_franka.diffik import (
+    FR3_Q_MAX,
+    FR3_Q_MIN,
+    compute_pose_error,
+    joint_limit_aware_dls_velocity,
+)
+from lerobot_robot_envframe_franka.franka_jacobian import fk_chain, zero_jacobian
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logging.getLogger().setLevel(logging.INFO)
@@ -56,7 +65,7 @@ WRIST_VIEW_BY_ARM = {"r": "wrist_right_minus", "l": "wrist_left_plus"}
 
 # Safe joint home per arm (mirror pair; from scripts/home.py _DEFAULT_POSE).
 HOME_Q_BY_ARM = {
-    "r": [0.6109, -0.6109, 0.0, -2.3562, 0.0, 1.8326, -0.7854],
+    "r": [0.4363, -0.6109, 0.0, -2.3562, 0.0, 1.8326, -1.1345],
     "l": [-0.6109, -0.6109, 0.0, -2.3562, 0.0, 1.8326, 0.7854],
 }
 
@@ -78,11 +87,38 @@ WINDOW = "wrist cam"
 # saved frame) under samples/<WRIST_VIEW>/ (shared store with the scene cams).
 OUT_DIR = samples_dir(WRIST_VIEW)
 # Min seconds between auto-captures, so a slow sweep past the board doesn't dump
-# dozens of near-identical frames.
-CAPTURE_INTERVAL_S = 0.5
+# dozens of near-identical frames. This scales with the slower circle period so
+# angular capture spacing stays approximately the same as the original
+# 15s-circle / 0.5s-capture trajectory.
+CAPTURE_INTERVAL_S = 1.0
 # Seconds to command the first pose (streaming, NOT saving) so the arm settles
 # off the home->start transit before any frame is captured (avoids motion blur).
 SETTLE_S = 3.0
+
+# Smooth, capture-free transits prevent the joint-IK loop from seeing the former
+# single-tick home -> first-pose jump (about 33cm plus a large reorientation).
+# The shorter inter-level transit only has to cover the 5cm z change.
+HOME_TO_START_S = 6.0
+BETWEEN_LEVELS_S = 4.0
+
+# Calibration-only joint-IK settings. Keep the inner loop fast so the held pose
+# remains actively tracked, but ask it to converge gently and cap each joint well
+# below the normal teleop limit. The robot-level dynamics factors additionally
+# bound velocity/acceleration/jerk in franky's motion generator.
+CALIBRATION_CART_GAIN = 2.0
+CALIBRATION_MAX_JOINT_VEL = 0.3
+CALIBRATION_JOINT_IK_RELATIVE_DYNAMICS = (0.15, 0.08, 0.05)
+HOME_MAX_TIME_S = 30.0
+CALIBRATION_JOINT_LIMIT_MARGIN_RAD = 0.10
+CALIBRATION_JOINT_LIMIT_VELOCITY_SCALE = 0.8
+CALIBRATION_JOINT_LIMIT_AVOIDANCE_GAIN = 0.15
+PREFLIGHT_EXTRA_MARGIN_RAD = 0.02
+PREFLIGHT_POSITION_TOL_M = 0.03
+PREFLIGHT_ROTATION_TOL_RAD = 0.15
+
+# Selected after homing by simulating both equivalent look-at roll branches.
+# A local-Z roll changes image roll but leaves the camera optical axis unchanged.
+LOOK_AT_ROLL_RAD = 0.0
 
 # Selected arm's joint home; rebound in main().
 HOME_Q = HOME_Q_BY_ARM[ARM]
@@ -90,23 +126,25 @@ HOME_Q = HOME_Q_BY_ARM[ARM]
 # RIGHT-arm trajectory params. The LEFT arm mirrors these across the env x-axis
 # (y -> -y on AIM_POINT and CENTER_XY); main() applies the mirror per --arm.
 # Point the EE +Z (wrist-cam optical axis) at this env-frame point every tick.
-AIM_POINT = np.array([-0.1, -0.1, 0.0])
+AIM_POINT = np.array([-0.2, 0.4, 0.0])
 # Env-frame xy center (meters) the circles are traced around (shared by all z
 # levels). Set to None to use the measured home EE xy instead.
-CENTER_XY = (-0.1, 0.1)
+CENTER_XY = (-0.1, 0.2)
 
 # Env-frame z heights (meters) to run one circle at, in order. One circle per z.
-Z_LEVELS = (0.55, 0.5)
+Z_LEVELS = (0.55, 0.45, 0.35)
 
 # Circle in the env xy-plane around CENTER_XY.
 RADIUS = 0.1      # meters
-PERIOD = 15.0       # seconds per revolution
+PERIOD = 30.0      # seconds per revolution
 REVOLUTIONS = 1
-RAMP = 2.0         # seconds to ease radius 0->full at start and full->0 at end
+RAMP = 4.0         # seconds to ease radius 0->full at start and full->0 at end
 FPS = 10.0
 
 
-def look_at_quat(cam_pos: np.ndarray, target: np.ndarray) -> np.ndarray:
+def look_at_quat(
+    cam_pos: np.ndarray, target: np.ndarray, roll_rad: float | None = None
+) -> np.ndarray:
     """EE orientation (quat xyzw) whose +Z axis points from cam_pos at target.
 
     Columns of the rotation are the EE x,y,z axes in env coords: +Z aims at the
@@ -122,15 +160,334 @@ def look_at_quat(cam_pos: np.ndarray, target: np.ndarray) -> np.ndarray:
     right = right / np.linalg.norm(right)           # EE +X
     down = np.cross(fwd, right)                      # EE +Y
     R = np.column_stack([right, down, fwd])
+    # Roll in the EE's local frame. This preserves column 2 (the +Z optical
+    # axis) while choosing between redundant wrist configurations. The selected
+    # branch is held fixed for the run, so quaternion targets remain continuous.
+    roll = LOOK_AT_ROLL_RAD if roll_rad is None else float(roll_rad)
+    R = R @ Rotation.from_rotvec([0.0, 0.0, roll]).as_matrix()
     return Rotation.from_matrix(R).as_quat()         # xyzw
 
 
+def _minimum_jerk(u: float) -> float:
+    """Quintic 0->1 blend with zero velocity/acceleration at both ends."""
+    u = float(np.clip(u, 0.0, 1.0))
+    return u * u * u * (10.0 + u * (-15.0 + 6.0 * u))
+
+
+def _slerp_quat(q0_xyzw: np.ndarray, q1_xyzw: np.ndarray, u: float) -> np.ndarray:
+    """Shortest-path unit-quaternion interpolation (xyzw)."""
+    q0 = np.asarray(q0_xyzw, dtype=np.float64)
+    q1 = np.asarray(q1_xyzw, dtype=np.float64)
+    q0 = q0 / np.linalg.norm(q0)
+    q1 = q1 / np.linalg.norm(q1)
+    dot = float(np.dot(q0, q1))
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+    dot = float(np.clip(dot, -1.0, 1.0))
+    if dot > 0.9995:
+        q = q0 + float(u) * (q1 - q0)
+        return q / np.linalg.norm(q)
+    angle = np.arccos(dot)
+    sin_angle = np.sin(angle)
+    return (
+        np.sin((1.0 - float(u)) * angle) / sin_angle * q0
+        + np.sin(float(u) * angle) / sin_angle * q1
+    )
+
+
+@dataclass(frozen=True)
+class TrajectoryTarget:
+    phase: str
+    pos: np.ndarray
+    quat_xyzw: np.ndarray
+    checkpoint: bool = False
+
+
+@dataclass(frozen=True)
+class PreflightResult:
+    roll_rad: float
+    safe: bool
+    min_margin_rad: float
+    limiting_joint: int
+    limit_clip_count: int
+    max_checkpoint_pos_error_m: float
+    max_checkpoint_rot_error_rad: float
+
+    def summary(self) -> str:
+        return (
+            f"roll={np.degrees(self.roll_rad):.0f}deg safe={self.safe} "
+            f"min_margin={self.min_margin_rad:.3f}rad (joint {self.limiting_joint}) "
+            f"limit_clips={self.limit_clip_count} checkpoint_error="
+            f"{self.max_checkpoint_pos_error_m * 1000.0:.1f}mm/"
+            f"{np.degrees(self.max_checkpoint_rot_error_rad):.1f}deg"
+        )
+
+
+def _transition_pose(
+    start_pos: np.ndarray,
+    start_quat_xyzw: np.ndarray,
+    end_pos: np.ndarray,
+    end_quat_xyzw: np.ndarray,
+    step: int,
+    n_steps: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    blend = _minimum_jerk(step / n_steps)
+    return (
+        start_pos + blend * (end_pos - start_pos),
+        _slerp_quat(start_quat_xyzw, end_quat_xyzw, blend),
+    )
+
+
+def _circle_pose(
+    center: np.ndarray,
+    step: int,
+    n_steps: int,
+    roll_rad: float | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    duration = PERIOD * REVOLUTIONS
+    t = duration * step / n_steps
+    if RAMP > 0:
+        scale = min(
+            _minimum_jerk(t / RAMP),
+            _minimum_jerk((duration - t) / RAMP),
+        )
+    else:
+        scale = 1.0
+    theta = 2.0 * np.pi * t / PERIOD
+    off = np.array(
+        [
+            RADIUS * scale * (np.cos(theta) - 1.0),
+            RADIUS * scale * np.sin(theta),
+            0.0,
+        ],
+        dtype=np.float64,
+    )
+    pos = center + off
+    return pos, look_at_quat(pos, AIM_POINT, roll_rad)
+
+
+def _calibration_targets(
+    start_pos: np.ndarray,
+    start_quat_xyzw: np.ndarray,
+    center_xy: np.ndarray,
+    roll_rad: float,
+) -> list[TrajectoryTarget]:
+    """Exact 10 Hz target sequence used to preflight one roll branch."""
+    targets: list[TrajectoryTarget] = []
+    transition_pos = np.asarray(start_pos, dtype=np.float64)
+    transition_quat = np.asarray(start_quat_xyzw, dtype=np.float64)
+    for level_idx, z in enumerate(Z_LEVELS):
+        center = np.array([center_xy[0], center_xy[1], z], dtype=np.float64)
+        center_quat = look_at_quat(center, AIM_POINT, roll_rad)
+        duration_s = HOME_TO_START_S if level_idx == 0 else BETWEEN_LEVELS_S
+        n_transition = max(1, int(round(duration_s * FPS)))
+        phase = "home_to_start" if level_idx == 0 else f"level_{level_idx}_transition"
+        for step in range(n_transition + 1):
+            pos, quat = _transition_pose(
+                transition_pos,
+                transition_quat,
+                center,
+                center_quat,
+                step,
+                n_transition,
+            )
+            targets.append(TrajectoryTarget(phase, pos, quat))
+
+        n_hold = max(1, int(round(SETTLE_S * FPS)))
+        for step in range(n_hold):
+            targets.append(
+                TrajectoryTarget(
+                    f"level_{level_idx}_settle",
+                    center.copy(),
+                    center_quat.copy(),
+                    checkpoint=step == n_hold - 1,
+                )
+            )
+
+        n_circle = max(1, int(round(PERIOD * REVOLUTIONS * FPS)))
+        for step in range(n_circle + 1):
+            pos, quat = _circle_pose(center, step, n_circle, roll_rad)
+            targets.append(
+                TrajectoryTarget(
+                    f"level_{level_idx}_circle",
+                    pos,
+                    quat,
+                    checkpoint=step == n_circle,
+                )
+            )
+        transition_pos, transition_quat = center, center_quat
+    return targets
+
+
+def _quat_wxyz_from_matrix(matrix: np.ndarray) -> np.ndarray:
+    x, y, z, w = Rotation.from_matrix(matrix).as_quat()
+    return np.array([w, x, y, z], dtype=np.float64)
+
+
+def _preflight_roll(
+    robot: EnvFrameFranka,
+    config: EnvFrameFrankaConfig,
+    q_start: np.ndarray,
+    T_start_base: np.ndarray,
+    start_pos_env: np.ndarray,
+    start_quat_env_xyzw: np.ndarray,
+    center_xy: np.ndarray,
+    roll_rad: float,
+) -> PreflightResult:
+    """Roll out the real controller equations without sending robot commands."""
+    q = np.asarray(q_start, dtype=np.float64).copy()
+    T_start_base = np.asarray(T_start_base, dtype=np.float64)
+    # Align the repo FK model to the measured O_T_EE once at the post-home q.
+    # The residual is a fixed tool-frame transform and remains valid in rollout.
+    model_start = fk_chain(q)[-1]
+    model_to_measured = np.linalg.inv(model_start) @ T_start_base
+
+    inner_steps = max(1, int(round(config.ik_hz / FPS)))
+    dt = 1.0 / config.ik_hz
+    min_margin = float("inf")
+    limiting_joint = 0
+    limit_clip_count = 0
+    max_checkpoint_pos_error = 0.0
+    max_checkpoint_rot_error = 0.0
+
+    targets = _calibration_targets(
+        start_pos_env, start_quat_env_xyzw, center_xy, roll_rad
+    )
+    for target in targets:
+        T_des = robot._env_to_base(ARM, target.pos, target.quat_xyzw)
+        quat_des = _quat_wxyz_from_matrix(T_des[:3, :3])
+        for _ in range(inner_steps):
+            T_cur = fk_chain(q)[-1] @ model_to_measured
+            pos_cur = T_cur[:3, 3]
+            quat_cur = _quat_wxyz_from_matrix(T_cur[:3, :3])
+            J = zero_jacobian(q, pos_cur)
+            dx = compute_pose_error(pos_cur, quat_cur, T_des[:3, 3], quat_des)
+            solution = joint_limit_aware_dls_velocity(
+                q,
+                J,
+                config.cart_gain * dx,
+                lam=config.dls_lambda,
+                max_joint_velocity=config.max_joint_vel,
+                position_margin_rad=config.joint_limit_safety_margin_rad,
+                velocity_scale=config.joint_limit_velocity_scale,
+                nullspace_gain=config.joint_limit_avoidance_gain,
+            )
+            if np.any(np.abs(solution.command - solution.requested) > 1.0e-6):
+                limit_clip_count += 1
+            q += solution.command * dt
+            margins = np.minimum(q - FR3_Q_MIN, FR3_Q_MAX - q)
+            i = int(np.argmin(margins))
+            if margins[i] < min_margin:
+                min_margin = float(margins[i])
+                limiting_joint = i + 1
+
+        if target.checkpoint:
+            T_cur = fk_chain(q)[-1] @ model_to_measured
+            quat_cur = _quat_wxyz_from_matrix(T_cur[:3, :3])
+            checkpoint_error = compute_pose_error(
+                T_cur[:3, 3], quat_cur, T_des[:3, 3], quat_des
+            )
+            max_checkpoint_pos_error = max(
+                max_checkpoint_pos_error,
+                float(np.linalg.norm(checkpoint_error[:3])),
+            )
+            max_checkpoint_rot_error = max(
+                max_checkpoint_rot_error,
+                float(np.linalg.norm(checkpoint_error[3:])),
+            )
+
+    safe = (
+        min_margin
+        >= config.joint_limit_safety_margin_rad + PREFLIGHT_EXTRA_MARGIN_RAD
+        and limit_clip_count == 0
+        and max_checkpoint_pos_error <= PREFLIGHT_POSITION_TOL_M
+        and max_checkpoint_rot_error <= PREFLIGHT_ROTATION_TOL_RAD
+    )
+    return PreflightResult(
+        roll_rad=roll_rad,
+        safe=safe,
+        min_margin_rad=min_margin,
+        limiting_joint=limiting_joint,
+        limit_clip_count=limit_clip_count,
+        max_checkpoint_pos_error_m=max_checkpoint_pos_error,
+        max_checkpoint_rot_error_rad=max_checkpoint_rot_error,
+    )
+
+
+def _select_safe_look_at_roll(
+    robot: EnvFrameFranka,
+    config: EnvFrameFrankaConfig,
+    q_start: np.ndarray,
+    T_start_base: np.ndarray,
+    start_pos_env: np.ndarray,
+    start_quat_env_xyzw: np.ndarray,
+    center_xy: np.ndarray,
+) -> PreflightResult:
+    """Choose between equivalent 0/pi optical-roll branches before moving."""
+    global LOOK_AT_ROLL_RAD
+    results = [
+        _preflight_roll(
+            robot,
+            config,
+            q_start,
+            T_start_base,
+            start_pos_env,
+            start_quat_env_xyzw,
+            center_xy,
+            roll,
+        )
+        for roll in (0.0, np.pi)
+    ]
+    for result in results:
+        logger.info("Preflight: %s", result.summary())
+    valid = [result for result in results if result.safe]
+    if not valid:
+        details = "; ".join(result.summary() for result in results)
+        raise RuntimeError(
+            "No safe look-at wrist-roll branch; calibration motion was not started. "
+            + details
+        )
+    chosen = max(valid, key=lambda result: result.min_margin_rad)
+    LOOK_AT_ROLL_RAD = chosen.roll_rad
+    logger.info(
+        "Selected %.0fdeg local optical-axis roll (joint margin %.3frad).",
+        np.degrees(chosen.roll_rad),
+        chosen.min_margin_rad,
+    )
+    return chosen
+
+
+def _pose_action(pos: np.ndarray, quat_xyzw: np.ndarray) -> dict[str, float]:
+    """Build one absolute env-frame pose action for the selected arm."""
+    return {
+        f"{ARM}_{k}": float(v)
+        for k, v in zip(EE_AXIS_KEYS, (*pos, *quat_xyzw))
+    }
+
+
 def _achieved_pose(obs: dict) -> np.ndarray | None:
-    """Achieved EE pose (env frame) from an observation: [x,y,z,qx,qy,qz,qw]."""
-    keys = [f"{ARM}_{k}" for k in EE_AXIS_KEYS]
-    if not all(k in obs for k in keys):
+    """Achieved EE pose (env frame) from an observation: [x,y,z,qx,qy,qz,qw].
+
+    EnvFrameFranka observations use the sim-matched vector schema
+    ``{left,right}_ee_pos`` plus ``{left,right}_ee_quat`` (WXYZ), while action
+    targets use the flat ``{l,r}_*`` XYZW schema. Convert the observation here
+    so every saved image has the achieved pose required by the hand-eye solve.
+    """
+    side = {"l": "left", "r": "right"}[ARM]
+    pos = obs.get(f"{side}_ee_pos")
+    quat_wxyz = obs.get(f"{side}_ee_quat")
+    if pos is None or quat_wxyz is None:
         return None
-    return np.array([float(obs[k]) for k in keys], dtype=np.float64)
+
+    pos = np.asarray(pos, dtype=np.float64)
+    quat_wxyz = np.asarray(quat_wxyz, dtype=np.float64)
+    if pos.shape != (3,) or quat_wxyz.shape != (4,):
+        return None
+
+    x, y, z = pos
+    qw, qx, qy, qz = quat_wxyz
+    return np.array([x, y, z, qx, qy, qz, qw], dtype=np.float64)
 
 
 class Capturer:
@@ -362,6 +719,70 @@ def solve_handeye(records: list[dict], image_size: tuple[int, int]) -> dict | No
     }
 
 
+def stream_pose_transition(
+    robot: EnvFrameFranka,
+    capturer: "Capturer",
+    start_pos: np.ndarray,
+    start_quat_xyzw: np.ndarray,
+    end_pos: np.ndarray,
+    end_quat_xyzw: np.ndarray,
+    duration_s: float,
+    label: str,
+) -> None:
+    """Stream a capture-free minimum-jerk Cartesian pose transition.
+
+    Position follows a quintic blend and orientation follows shortest-path SLERP
+    evaluated at the same blend value. Consequently the pose target starts and
+    ends with zero velocity and acceleration instead of jumping in one IK tick.
+    """
+    start_pos = np.asarray(start_pos, dtype=np.float64)
+    end_pos = np.asarray(end_pos, dtype=np.float64)
+    start_quat_xyzw = np.asarray(start_quat_xyzw, dtype=np.float64)
+    end_quat_xyzw = np.asarray(end_quat_xyzw, dtype=np.float64)
+    n_steps = max(1, int(round(duration_s * FPS)))
+    period = 1.0 / FPS
+    logger.info("%s over %.1fs (%d target steps, no capture).", label, duration_s, n_steps)
+
+    for step in range(n_steps + 1):
+        t0 = time.perf_counter()
+        cmd_pos, cmd_quat = _transition_pose(
+            start_pos,
+            start_quat_xyzw,
+            end_pos,
+            end_quat_xyzw,
+            step,
+            n_steps,
+        )
+        robot.send_action(_pose_action(cmd_pos, cmd_quat))
+        capturer.step(robot, save=False)
+        robot.check_motion_health()
+
+        dt = time.perf_counter() - t0
+        if dt < period:
+            time.sleep(period - dt)
+
+
+def hold_pose(
+    robot: EnvFrameFranka,
+    capturer: "Capturer",
+    pos: np.ndarray,
+    quat_xyzw: np.ndarray,
+    duration_s: float,
+) -> None:
+    """Hold a pose for settling while streaming video but taking no samples."""
+    action = _pose_action(pos, quat_xyzw)
+    deadline = time.perf_counter() + duration_s
+    period = 1.0 / FPS
+    while time.perf_counter() < deadline:
+        t0 = time.perf_counter()
+        robot.send_action(action)
+        capturer.step(robot, save=False)
+        robot.check_motion_health()
+        dt = time.perf_counter() - t0
+        if dt < period:
+            time.sleep(period - dt)
+
+
 def trace_circle(robot: EnvFrameFranka, center: np.ndarray, capturer: "Capturer") -> None:
     """Trace one ramped xy-plane circle around `center`, EE +Z aimed at AIM_POINT.
 
@@ -369,27 +790,18 @@ def trace_circle(robot: EnvFrameFranka, center: np.ndarray, capturer: "Capturer"
     ramp eases the radius 0->full->0, so the path starts and ends exactly at
     `center` (no velocity jolt entering/leaving a level).
     """
-    omega = 2.0 * np.pi / PERIOD
     duration = PERIOD * REVOLUTIONS
-    n_steps = int(round(duration * FPS))
+    n_steps = max(1, int(round(duration * FPS)))
     period = 1.0 / FPS
 
-    for step in range(n_steps):
+    # Include the final endpoint so the next level transition starts from exactly
+    # the same center pose instead of inheriting a residual circle offset.
+    for step in range(n_steps + 1):
         t0 = time.perf_counter()
-        t = step / FPS
-
-        scale = min(1.0, t / RAMP, max(0.0, (duration - t) / RAMP)) if RAMP > 0 else 1.0
-        theta = omega * t
-        off = np.zeros(3, dtype=np.float64)
-        off[0] = RADIUS * scale * (np.cos(theta) - 1.0)  # env x
-        off[1] = RADIUS * scale * np.sin(theta)          # env y
-
-        cmd_pos = center + off
-        quat_xyzw = look_at_quat(cmd_pos, AIM_POINT)  # EE +Z aims at AIM_POINT
-        action = {f"{ARM}_{k}": float(v)
-                  for k, v in zip(EE_AXIS_KEYS, (*cmd_pos, *quat_xyzw))}
-        robot.send_action(action)
+        cmd_pos, quat_xyzw = _circle_pose(center, step, n_steps)
+        robot.send_action(_pose_action(cmd_pos, quat_xyzw))
         capturer.step(robot)
+        robot.check_motion_health()
 
         dt = time.perf_counter() - t0
         if dt < period:
@@ -428,6 +840,15 @@ def main() -> None:
     default_cams = EnvFrameFrankaConfig(active_arms=(ARM,), enable_cameras=True).cameras
     cfg = EnvFrameFrankaConfig(
         active_arms=(ARM,),
+        control_mode="joint_ik",
+        cart_gain=CALIBRATION_CART_GAIN,
+        max_joint_vel=CALIBRATION_MAX_JOINT_VEL,
+        joint_limit_safety_margin_rad=CALIBRATION_JOINT_LIMIT_MARGIN_RAD,
+        joint_limit_velocity_scale=CALIBRATION_JOINT_LIMIT_VELOCITY_SCALE,
+        joint_limit_avoidance_gain=CALIBRATION_JOINT_LIMIT_AVOIDANCE_GAIN,
+        abort_on_joint_limit=True,
+        raise_on_motion_error=True,
+        joint_ik_relative_dynamics=CALIBRATION_JOINT_IK_RELATIVE_DYNAMICS,
         enable_cameras=True,
         cameras={WRIST_VIEW: default_cams[WRIST_VIEW]},
     )
@@ -437,37 +858,74 @@ def main() -> None:
     try:
         robot.connect()
         logger.info("Homing %s arm.", ARM)
-        robot.home({ARM: np.asarray(HOME_Q, dtype=np.float64)})
+        homed = robot.home(
+            {ARM: np.asarray(HOME_Q, dtype=np.float64)},
+            max_time_s=HOME_MAX_TIME_S,
+        )
+        if not homed:
+            raise RuntimeError(
+                f"{ARM} arm did not reach home within {HOME_MAX_TIME_S:.1f}s; "
+                "calibration motion was not started."
+            )
 
         # xy circle center: CENTER_XY if set, else the measured home EE xy.
-        start = robot.current_ee_pose_env()[ARM]
+        q_start, T_start_base = robot.robot_manager.current_ik_state_batch([ARM])[ARM]
+        start = robot._base_to_env(ARM, T_start_base)
         center_xy = (np.asarray(CENTER_XY, dtype=np.float64) if CENTER_XY is not None
                      else np.asarray(start[0], dtype=np.float64)[:2].copy())
         logger.info("Home EE pos (env): %s; center_xy=%s; aiming EE +Z at %s",
                     start[0], center_xy, AIM_POINT)
+        logger.info("Preflighting equivalent look-at wrist-roll branches.")
+        _select_safe_look_at_roll(
+            robot,
+            cfg,
+            q_start,
+            T_start_base,
+            np.asarray(start[0], dtype=np.float64),
+            np.asarray(start[1], dtype=np.float64),
+            center_xy,
+        )
         logger.info(
             "Tracing %d circle(s) at z=%s, %.1f rev(s) each at %.1f Hz, r=%.3fm "
             "(Ctrl-C to stop).",
             len(Z_LEVELS), Z_LEVELS, REVOLUTIONS, FPS, RADIUS,
         )
 
-        # Command the first circle's start pose and stream (NOT saving) for
-        # SETTLE_S so the arm settles off the home->start transit before capture.
-        start_center = np.array([center_xy[0], center_xy[1], Z_LEVELS[0]], dtype=np.float64)
-        start_quat = look_at_quat(start_center, AIM_POINT)
-        start_action = {f"{ARM}_{k}": float(v)
-                        for k, v in zip(EE_AXIS_KEYS, (*start_center, *start_quat))}
-        logger.info("Settling on first pose for %.1fs before capture.", SETTLE_S)
-        t_settle = time.perf_counter()
-        while time.perf_counter() - t_settle < SETTLE_S:
-            robot.send_action(start_action)
-            capturer.step(robot, save=False)
-            time.sleep(1.0 / FPS)
-
-        for z in Z_LEVELS:
+        # Smoothly reach each level with capture disabled. The first transit starts
+        # from the measured home pose; later ones start from the exact center pose
+        # commanded at the end of the preceding circle, preserving target continuity.
+        transition_pos = np.asarray(start[0], dtype=np.float64)
+        transition_quat = np.asarray(start[1], dtype=np.float64)
+        for level_idx, z in enumerate(Z_LEVELS):
             center = np.array([center_xy[0], center_xy[1], z], dtype=np.float64)
+            center_quat = look_at_quat(center, AIM_POINT)
+            duration_s = HOME_TO_START_S if level_idx == 0 else BETWEEN_LEVELS_S
+            label = "Moving smoothly from home to first calibration pose" if level_idx == 0 else (
+                f"Moving smoothly to calibration level z={z:.3f}"
+            )
+            stream_pose_transition(
+                robot,
+                capturer,
+                transition_pos,
+                transition_quat,
+                center,
+                center_quat,
+                duration_s,
+                label,
+            )
+            logger.info("Settling at z=%.3f for %.1fs before capture.", z, SETTLE_S)
+            hold_pose(robot, capturer, center, center_quat, SETTLE_S)
             logger.info("Circle at z=%.3f (center=%s).", z, center)
             trace_circle(robot, center, capturer)
+            transition_pos, transition_quat = center, center_quat
+
+        logger.info(
+            "Collection trajectory complete: traced %d circle(s); captured %d frame(s); "
+            "image_size=%s.",
+            len(Z_LEVELS),
+            len(capturer.records),
+            capturer.image_size,
+        )
     except KeyboardInterrupt:
         logger.info("Ctrl-C received; stopping the arm and disconnecting.")
     finally:
@@ -484,15 +942,31 @@ def main() -> None:
 
     # Arm is down; run the hand-eye solve and persist results/<view>.json (same
     # results store as the scene-cam camera_calibration.py path).
-    if capturer.image_size is not None and capturer.records:
+    if capturer.image_size is None:
+        logger.warning("Hand-eye solve skipped: no wrist-camera frames were received.")
+    elif not capturer.records:
+        logger.warning(
+            "Hand-eye solve skipped: collected zero usable ChArUco detections. "
+            "Check the live overlay and board visibility."
+        )
+    else:
+        logger.info(
+            "Starting hand-eye solve from %d captured frame(s) at image_size=%s.",
+            len(capturer.records),
+            capturer.image_size,
+        )
         try:
             result = solve_handeye(capturer.records, capturer.image_size)
             if result is not None:
                 data = load_results(WRIST_VIEW)
                 data.update(result)
                 save_results(WRIST_VIEW, data)
+            else:
+                logger.warning("Hand-eye solve returned no result.")
         except Exception:
             logger.exception("hand-eye solve failed")
+            print("hand-eye solve failed; traceback follows:", file=sys.stdout, flush=True)
+            traceback.print_exc(file=sys.stdout)
 
 
 if __name__ == "__main__":

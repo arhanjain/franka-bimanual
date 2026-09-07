@@ -37,7 +37,7 @@ criteria = (cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_MAX_ITER, 30, 0.001)
 CHARUCO_SQUARES = (11, 11)
 CHARUCO_SQUARE_SIZE = 0.05    # 5 cm checker square (measured)
 CHARUCO_MARKER_SIZE = 0.039   # 3.9 cm black ArUco marker (measured)
-CHARUCO_MIN_CORNERS = 6       # min interpolated corners for a usable view
+CHARUCO_MIN_CORNERS = 10       # min interpolated corners for a usable view
 
 _charuco_dict = cv.aruco.getPredefinedDictionary(cv.aruco.DICT_4X4_1000)
 charuco_board = cv.aruco.CharucoBoard(

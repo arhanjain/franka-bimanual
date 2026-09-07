@@ -66,7 +66,7 @@ _DEFAULT_SCENE_CAMS: dict[str, tuple[str, str, int, int]] = {
 _DEFAULT_WRIST_CAMS: dict[str, tuple[str, str, int, int]] = {
     # "l": ("wrist_left_minus", "192.168.1.138", 960, 600),
     # "l": ("wrist_left_plus", "192.168.1.139", 960, 600),
-    "l": ("wrist_left_plus", "192.168.1.139", 960, 600),
+    "l": ("wrist_left_plus", "192.168.1.138", 960, 600),
     "r": ("wrist_right_minus", "192.168.0.142", 960, 600),
     # "r+": ("wrist_right_plus", "192.168.0.143", 960, 600),
 }
@@ -129,6 +129,21 @@ class EnvFrameFrankaConfig(RobotConfig):
         default_factory=lambda: {k: v for k, v in _DEFAULT_BASE_IN_ENV.items()}
     )
 
+    # Tool offset (meters, link8 axes) applied to franky's O_T_EE on both sides
+    # of the loop. On THIS rig franky's O_T_EE IS panda_link8 (WSG gripper =>
+    # identity F_T_EE; verified by FK == recorded data), so this is a chosen
+    # virtual tool point, not the physical hand TCP. The env<->base helpers apply
+    # it as: reported = O_T_EE @ Translate(-link8_to_ee) (read) and commanded
+    # O_T_EE = target @ Translate(+link8_to_ee) (command). With +z_tool pointing
+    # toward the gripper, link8_to_ee = (0,0,-0.1034) puts the reference at
+    # link8 + 0.1034 z_tool -- the grasp/fingertip side, OUT toward the gripper
+    # (NOT up inside the wrist). Sim matches this frame with the OPPOSITE-signed
+    # config value (DiffIK body_offset & ee_frame OffsetCfg = +0.1034), because
+    # sim adds the offset directly while these helpers negate it on read. Set to
+    # (0, 0, 0) to report/command raw O_T_EE (== link8).
+    #ink8_to_ee: tuple[float, float, float] = (0.0, 0.0, 0.1034)
+    link8_to_ee: tuple[float, float, float] = (0.0, 0.0, 0.0)
+
     # Cameras, keyed by observation/view name (same Arv/Framos configs as
     # BimanualFrankaConfig). When enable_cameras is True and `cameras` is left
     # empty, __post_init__ populates the default rig (both scene cams + one wrist
@@ -157,8 +172,31 @@ class EnvFrameFrankaConfig(RobotConfig):
     # 4.0. Start low and raise until tracking is crisp without ringing.
     cart_gain: float = 6.0
     max_joint_vel: float = 1.0           # rad/s; per-joint commanded-velocity clamp (singularity/safety guard)
+    # Optional FR3 joint-limit protection for joint_ik. Defaults retain the
+    # previous DLS redundancy behavior; calibration enables all of these.
+    joint_limit_safety_margin_rad: float = 0.0
+    """Move the position-dependent stopping boundary inward by this many radians."""
+    joint_limit_velocity_scale: float = 1.0
+    """Scale the FR3's directional position-based velocity bounds (0, 1]."""
+    joint_limit_avoidance_gain: float = 0.0
+    """Null-space joint-centering gain in 1/s; zero disables redundancy bias."""
+    abort_on_joint_limit: bool = False
+    """Abort joint_ik instead of stalling when an outward command reaches the margin."""
+    raise_on_motion_error: bool = False
+    """Propagate driver motion faults so a caller can stop instead of auto-retrying."""
     joint_stiffness: tuple[float, ...] = _SIM_JOINT_STIFFNESS
     joint_ik_relative_dynamics: tuple[float, ...] = _JOINT_IK_RELATIVE_DYNAMICS
+    # Execution window per send_action (seconds), joint_ik only. When > 0 the inner
+    # IK loop drives toward each commanded pose for exactly this long, then HOLDS in
+    # place (zero joint velocity) until the next send_action. This gives every action
+    # a fixed, uniform amount of execution regardless of how long the caller takes to
+    # produce the next one (e.g. a slow policy-inference tick at the chunk boundary),
+    # matching sim's fixed-dt stepping. 0 disables the deadline -- the loop then drives
+    # continuously toward the held target (the original behavior; used by open-ended
+    # setpoint scripts like jog/circle that send one distant target and expect the loop
+    # to keep converging past one control period). Ignored in twist mode
+    # (CartesianVelocityMotion already self-decays after its command window).
+    control_period_s: float = 0.0
 
     def __post_init__(self):
         if hasattr(super(), "__post_init__"):
@@ -177,6 +215,15 @@ class EnvFrameFrankaConfig(RobotConfig):
             raise ValueError(f"Invalid active arm identifiers: {invalid}. Allowed: {_VALID_ARMS}.")
 
         self.active_arms = tuple(dict.fromkeys(self.active_arms))
+
+        if self.max_joint_vel <= 0.0:
+            raise ValueError("max_joint_vel must be positive.")
+        if self.joint_limit_safety_margin_rad < 0.0:
+            raise ValueError("joint_limit_safety_margin_rad must be non-negative.")
+        if not 0.0 < self.joint_limit_velocity_scale <= 1.0:
+            raise ValueError("joint_limit_velocity_scale must be in (0, 1].")
+        if self.joint_limit_avoidance_gain < 0.0:
+            raise ValueError("joint_limit_avoidance_gain must be non-negative.")
 
         missing = [arm for arm in self.active_arms if arm not in self.base_in_env]
         if missing:

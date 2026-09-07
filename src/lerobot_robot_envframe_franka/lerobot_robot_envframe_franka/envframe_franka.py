@@ -1,9 +1,14 @@
 """Minimal env-frame, EE-pose-only bimanual Franka robot for LeRobot.
 
-Actions and observations are absolute EE poses expressed in the sim **env frame**
-(world-aligned axes, shared origin), keyed ``{arm}_{x,y,z,qx,qy,qz,qw}`` per
-active arm (quaternion xyzw). The action interface is identical across two
-actuation modes selected by ``config.control_mode``:
+Actions and observations live in the sim **env frame** (world-aligned axes,
+shared origin). The ACTION interface is the flat absolute-EE-pose dict keyed
+``{arm}_{x,y,z,qx,qy,qz,qw[,gripper]}`` per active arm (quaternion xyzw,
+``arm`` in ``l``/``r``). The OBSERVATION mirrors the sim LBM-Scenario state
+ObsGroup, UNCONCATENATED -- one named vector term per quantity per arm side
+(``{side}_ee_pos``, ``{side}_ee_quat`` WXYZ, ``{side}_panda_joint_pos``,
+``{side}_gripper_pos``; ``side`` in ``left``/``right``), so a sim-trained policy
+reads the same keys. The action interface is identical across two actuation
+modes selected by ``config.control_mode``:
 
 - ``"twist"`` (default): ``send_action`` converts the env-frame target into each
   arm's base frame and tracks it with a base-frame Cartesian-velocity PD twist
@@ -21,7 +26,12 @@ actuation modes selected by ``config.control_mode``:
   unheld between moves and it would sag. See franka_link.py.)
 
 ``get_observation`` transforms the measured base-frame ``O_T_EE`` back into the
-env frame in both modes.
+env frame in both modes. The env-frame pose is the **panda_link8** frame (sim's
+controlled frame: DiffIK ``body_name="panda_link8"``, ``body_offset=None``), not
+franky's ``O_T_EE`` (which sits ``config.link8_to_ee`` past link8 at the Franka
+Hand TCP). The two env<->base helpers shift by that offset on read and command so
+the same xyz means the same physical frame in sim and real (existing
+link8-referenced sim datasets/policies stay valid).
 """
 
 import logging
@@ -37,10 +47,16 @@ from lerobot.robots import Robot
 from lerobot.types import RobotAction, RobotObservation
 
 from .actions import ArmAction, BimanualAction
-from .diffik import compute_pose_error, dls_delta_q
+from .diffik import (
+    FR3_Q_MAX,
+    FR3_Q_MIN,
+    compute_pose_error,
+    dls_delta_q,
+    joint_limit_aware_dls_velocity,
+)
 from .envframe_franka_config import EnvFrameFrankaConfig
 from .franka_jacobian import zero_jacobian
-from .franka_link import MultiRobotWrapper
+from .franka_link import MotionCommandError, MultiRobotWrapper
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +94,22 @@ EE_AXIS_KEYS: tuple[str, ...] = ("x", "y", "z", "qx", "qy", "qz", "qw")
 # ACCEPTED but not actuated yet (no gripper hardware in the env-frame stack).
 ACTION_AXIS_KEYS: tuple[str, ...] = (*EE_AXIS_KEYS, "gripper")
 
+# Observation mirrors the sim LBM-Scenario state ObsGroup, UNCONCATENATED: one
+# named term per quantity per arm side (not sim's flat concatenated vector).
+# arm 'l'->'left', 'r'->'right' matches sim left_panda/right_panda. Term names,
+# frame, and quaternion order match sim exactly so a sim-trained policy reads the
+# same dict keys:
+#   {side}_ee_pos          (3,)  panda_link8 position, env frame [m]
+#   {side}_ee_quat         (4,)  panda_link8 orientation, env frame, WXYZ
+#   {side}_panda_joint_pos (7,)  arm joint angles [rad]
+#   {side}_gripper_pos     (1,)  finger gap [m]
+# NOTE width gap vs sim: sim's *_panda_joint_pos is the FULL articulation DOF
+# (12: 7 arm + gripper/adapter DOFs); the real franky driver exposes only the 7
+# arm joints, so this term is 7-dim on real. Quaternions are WXYZ here (sim
+# convention) -- the franky boundary still works in XYZW internally.
+_ARM_TO_SIDE: dict[str, str] = {"l": "left", "r": "right"}
+JOINT_DOF: int = 7
+
 # Cartesian PD tracking gains + velocity clamps (mirror bimanual_franka EE mode +
 # safety.py limits). The pose target is tracked by a base-frame twist command.
 EE_PD_KP, EE_PD_KD = 2.0, 0.1
@@ -91,6 +123,9 @@ EE_ANGULAR_VELOCITY_MAX = 1.20  # rad/s
 # redundant elbow/wrist free and cannot guarantee that).
 JOINT_PD_KP, JOINT_PD_KD = 2.0, 0.1
 JOINT_VELOCITY_MAX = 2.0  # rad/s
+
+# Zero joint-velocity command reused by the joint_ik hold path (see _ik_loop).
+_ZERO_JV = [0.0] * JOINT_DOF
 
 
 def _clamp_norm(v: np.ndarray, max_norm: float) -> np.ndarray:
@@ -111,6 +146,10 @@ def _make_gripper(name: str, ip: str):
     from lerobot_robot_bimanual_franka.wsg import WSG
 
     return WSG(name=name, TCP_IP=ip, do_print=False)
+
+
+class JointLimitSafetyError(RuntimeError):
+    """Raised before an IK command can drive a joint through its safety margin."""
 
 
 class EnvFrameFranka(Robot):
@@ -148,21 +187,51 @@ class EnvFrameFranka(Robot):
                 np.array([px, py, pz], dtype=np.float64),
             )
 
+        # link8 <-> O_T_EE offset (config.link8_to_ee, link8 axes). The driver
+        # reads/commands O_T_EE; sim controls panda_link8 with no tool offset. The
+        # env<->base boundary helpers shift between the two so the env-frame pose
+        # means link8 (sim's frame). Pure translation, so post-multiply 4x4s:
+        # base->link8 = (base->O_T_EE) @ ee_to_link8; base->O_T_EE = (base->link8)
+        # @ link8_to_ee. Identity when link8_to_ee == (0,0,0).
+        r = np.asarray(config.link8_to_ee, dtype=np.float64)
+        self._link8_to_ee = np.eye(4)
+        self._link8_to_ee[:3, 3] = r
+        self._ee_to_link8 = np.eye(4)
+        self._ee_to_link8[:3, 3] = -r
+
         # joint_ik mode: the inner resolved-rate loop tracks a held base-frame
         # target pose per arm. send_action only updates _targets (under
         # _target_lock); _ik_thread runs the IK at config.ik_hz.
         self._joint_ik = config.control_mode == "joint_ik"
         self._targets: dict[str, tuple[np.ndarray, np.ndarray]] = {}  # arm -> (pos_base, quat_base_wxyz)
+        # When config.control_period_s > 0, each send_action stamps a deadline
+        # (perf_counter seconds) after which the IK loop HOLDS instead of driving
+        # further toward the held target -- so every action gets a fixed, uniform
+        # execution window regardless of the caller's tick jitter. None = no deadline
+        # (drive continuously; the original behavior).
+        self._control_period_s = float(config.control_period_s)
+        self._target_deadline: float | None = None
+        # Raw per-arm kinematic state from the last get_observation (q, dq, O_T_EE,
+        # twist); consumed by an optional data-collector wrapper. None until first read.
+        self._last_kin: dict | None = None
         self._target_lock = threading.Lock()
         self._ik_thread: threading.Thread | None = None
         self._ik_stop = threading.Event()
+        self._ik_error: BaseException | None = None
 
     # ------------------------------------------------------------------
     # LeRobot Robot contract
     # ------------------------------------------------------------------
     @property
-    def _arm_features(self) -> dict[str, type]:
-        return {f"{arm}_{key}": float for arm in self.active_arms for key in EE_AXIS_KEYS}
+    def _arm_features(self) -> dict[str, tuple[int]]:
+        # Unconcatenated sim-matched terms per active arm side (vector-valued).
+        out: dict[str, tuple[int]] = {}
+        for arm in self.active_arms:
+            side = _ARM_TO_SIDE[arm]
+            out[f"{side}_ee_pos"] = (3,)
+            out[f"{side}_ee_quat"] = (4,)
+            out[f"{side}_panda_joint_pos"] = (JOINT_DOF,)
+        return out
 
     @property
     def _camera_features(self) -> dict[str, tuple[int, int, int]]:
@@ -174,12 +243,13 @@ class EnvFrameFranka(Robot):
         return out
 
     @property
-    def _gripper_features(self) -> dict[str, type]:
-        return {f"{arm}_gripper": float for arm in self.grippers}
+    def _gripper_features(self) -> dict[str, tuple[int]]:
+        return {f"{_ARM_TO_SIDE[arm]}_gripper_pos": (1,) for arm in self.grippers}
 
     @property
-    def observation_features(self) -> dict[str, type | tuple[int, int, int]]:
-        # EE pose per arm + gripper width (when enabled) + any configured cameras.
+    def observation_features(self) -> dict[str, tuple[int, ...]]:
+        # Sim-matched unconcatenated terms: per-arm EE pose (pos + quat wxyz) and
+        # joint angles, per-arm gripper gap (when enabled), plus any cameras.
         return {**self._arm_features, **self._gripper_features, **self._camera_features}
 
     @property
@@ -210,6 +280,7 @@ class EnvFrameFranka(Robot):
             extra = dict(
                 stiffness=tuple(self.config.joint_stiffness),
                 dynamics=tuple(self.config.joint_ik_relative_dynamics),
+                raise_motion_errors=bool(self.config.raise_on_motion_error),
             )
         try:
             for n, cam in self.cameras.items():
@@ -258,31 +329,43 @@ class EnvFrameFranka(Robot):
         self._close_grippers()
         self.robot_manager.shutdown()
 
-    def get_observation(self) -> RobotObservation:
+    def get_observation(self, include_cameras: bool = True) -> RobotObservation:
         if not self.is_connected:
             raise ConnectionError(f"{self} is not connected.")
 
         # Kick off camera reads in parallel with the (blocking) kinematic query.
+        # include_cameras=False skips the camera reads entirely (low-dim only),
+        # so a recorder/teleop loop can read proprio cheaply without contending
+        # with a separate camera-grid reader for the same buffers.
         cam_futs = {}
-        if self._camera_pool is not None:
+        if include_cameras and self._camera_pool is not None:
             cam_futs = {
                 n: self._camera_pool.submit(cam.async_read, _CAMERA_READ_TIMEOUT_MS)
                 for n, cam in self.cameras.items()
             }
 
         kin = self.robot_manager.current_kinematic_state_batch(list(self.active_arms))
+        # Stash the raw per-arm kinematic state (q, dq, O_T_EE, twist) so a wrapper
+        # (e.g. the data collector) can record full joint/velocity state without a
+        # second RPC round-trip. Overwritten each call; not part of the obs dict.
+        self._last_kin = kin
         obs: RobotObservation = {}
         for arm in self.active_arms:
-            _, _, T_eb, _ = kin[arm]
-            p_ee, q_ee = self._base_to_env(arm, T_eb)
-            for key, val in zip(EE_AXIS_KEYS, (*p_ee, *q_ee)):
-                obs[f"{arm}_{key}"] = float(val)
+            side = _ARM_TO_SIDE[arm]
+            q, _, T_eb, _ = kin[arm]
+            p_ee, q_ee_xyzw = self._base_to_env(arm, T_eb)  # link8 pose, env frame
+            qx, qy, qz, qw = q_ee_xyzw
+            obs[f"{side}_ee_pos"] = np.asarray(p_ee, dtype=np.float32)
+            obs[f"{side}_ee_quat"] = np.array([qw, qx, qy, qz], dtype=np.float32)  # WXYZ (sim)
+            obs[f"{side}_panda_joint_pos"] = np.asarray(q, dtype=np.float32)[:JOINT_DOF]
 
         # Gripper finger gap in METERS (last cached POS? mm /1000; never blocks),
-        # matching the action units and sim's gripper_pos convention.
+        # matching sim's gripper_pos convention (total opening width in meters).
         for arm, g in self.grippers.items():
             pos = g.position
-            obs[f"{arm}_gripper"] = (0.0 if pos is None else pos) / 1000.0
+            obs[f"{_ARM_TO_SIDE[arm]}_gripper_pos"] = np.array(
+                [(0.0 if pos is None else pos) / 1000.0], dtype=np.float32
+            )
 
         for n, fut in cam_futs.items():
             try:
@@ -292,6 +375,68 @@ class EnvFrameFranka(Robot):
                 blank = getattr(self.cameras[n], "blank_frame", None)
                 obs[n] = blank() if callable(blank) else np.zeros(self._camera_features[n], dtype=np.uint8)
         return obs
+
+    def connect_cameras(self) -> None:
+        """Bring up only the cameras (no arms/grippers) for a vision-only session.
+
+        Lets ``read_camera_frames`` / ``view_cameras`` run without the FR3 arms
+        online. A camera that fails to connect is logged and skipped rather than
+        aborting the rest.
+        """
+        for n, cam in self.cameras.items():
+            try:
+                cam.connect()
+                _cam_status(n, cam, ok=True)
+            except Exception as e:
+                _cam_status(n, cam, ok=False)
+                logger.warning("Camera %s failed to connect: %s", n, e)
+
+    def read_camera_frames(self) -> dict[str, np.ndarray | None]:
+        """Read just the cameras (parallel), keyed by view name; no arm query.
+
+        Unlike ``get_observation`` this does not touch the arms, so it works for a
+        vision-only session (cameras connected, arms offline). A camera that
+        errors yields ``None`` for that view rather than raising, so a single bad
+        camera never blanks the whole grid.
+        """
+        if self._camera_pool is None:
+            return {}
+        futs = {
+            n: self._camera_pool.submit(cam.async_read, _CAMERA_READ_TIMEOUT_MS)
+            for n, cam in self.cameras.items()
+        }
+        out: dict[str, np.ndarray | None] = {}
+        for n, fut in futs.items():
+            try:
+                out[n] = fut.result()
+            except Exception as e:
+                logger.warning("Camera %s read failed: %s", n, e)
+                out[n] = None
+        return out
+
+    def view_cameras(self, tile_h: int = 240, fps: float = 30.0, cols: int | None = None,
+                     save_path: str = "camera_grid.png") -> None:
+        """Pop up a live OpenCV grid of the connected cameras until 'q'/ESC.
+
+        Convenience wrapper around ``camera_viz.stream_grid`` reading this robot's
+        cameras each tick (``s`` saves the current grid). Requires a display and
+        that ``connect()`` has brought the cameras up.
+        """
+        from .camera_viz import stream_grid
+
+        if not self.cameras:
+            raise RuntimeError("No cameras configured (enable_cameras=True needed).")
+        stream_grid(self.read_camera_frames, cols=cols, tile_h=tile_h, fps=fps,
+                    save_path=save_path)
+
+    def check_motion_health(self) -> None:
+        """Raise in the caller after a background joint_ik safety/driver fault."""
+        with self._target_lock:
+            ik_error = self._ik_error
+        if ik_error is not None:
+            raise RuntimeError(
+                "joint_ik stopped after a safety or driver error"
+            ) from ik_error
 
     def send_action(self, action: RobotAction | BimanualAction) -> RobotAction:
         """Command an absolute env-frame pose (+ gripper) per arm.
@@ -307,6 +452,8 @@ class EnvFrameFranka(Robot):
         ~0.109 m; the driver caps the open end at 0.1 m. Non-blocking; the WSG
         sender coalesces repeats. If grippers are disabled the field is ignored.
         """
+        self.check_motion_health()
+
         cmd = action if isinstance(action, BimanualAction) else BimanualAction.from_robot_action(action)
         self._actuate_grippers(cmd)
         if self._joint_ik:
@@ -326,6 +473,20 @@ class EnvFrameFranka(Robot):
                 g.move(width_mm, blocking=False)
             except Exception as e:
                 logger.warning("Gripper %s move failed: %s", arm, e)
+
+    def open_grippers(self, width_m: float = 0.1, blocking: bool = True) -> None:
+        """Open every active WSG gripper to ``width_m`` meters (default fully open).
+
+        Used at episode reset so a run starts with empty, open grippers regardless
+        of where the previous episode left them. No-op when grippers are disabled.
+        ``width_m`` is the finger gap in meters (sim units, same as the action
+        field); the WSG clamps to its usable ~10..100 mm stroke.
+        """
+        for arm, g in self.grippers.items():
+            try:
+                g.move(float(width_m) * 1000.0, blocking=blocking)  # meters -> mm
+            except Exception as e:
+                logger.warning("Gripper %s open failed: %s", arm, e)
 
     def send_bimanual_action(self, action: BimanualAction) -> BimanualAction:
         """Typed entry point; identical effect to ``send_action`` of the struct."""
@@ -367,6 +528,12 @@ class EnvFrameFranka(Robot):
             targets[arm] = (T_tb[:3, 3].copy(), _quat_wxyz_from_matrix(T_tb[:3, :3]))
         with self._target_lock:
             self._targets = targets
+            # Give this action a fixed execution window; the loop drives toward the
+            # target until the deadline, then holds. None => drive continuously.
+            self._target_deadline = (
+                time.perf_counter() + self._control_period_s
+                if self._control_period_s > 0.0 else None
+            )
         self._ensure_ik_thread()
 
     # ------------------------------------------------------------------
@@ -420,6 +587,23 @@ class EnvFrameFranka(Robot):
             t0 = time.perf_counter()
             with self._target_lock:
                 targets = self._targets
+                deadline = self._target_deadline
+            # Past the action's execution window: HOLD in place (re-send zero joint
+            # velocity every tick so the FR3 joint controller keeps the arm at its
+            # current pose under joint impedance, and the velocity command window
+            # never lapses) until the next send_action refreshes target+deadline.
+            # This is what gives each action a uniform amount of executed motion: a
+            # slow caller (e.g. a chunk-boundary inference spike) holds here instead
+            # of over-converging toward the previous target.
+            if targets and deadline is not None and t0 >= deadline:
+                try:
+                    self.robot_manager.move_joint_velocity_batch({arm: _ZERO_JV for arm in targets})
+                except Exception:
+                    logger.exception("IK loop hold tick failed; retrying next tick")
+                dt = time.perf_counter() - t0
+                if dt < period:
+                    self._ik_stop.wait(period - dt)
+                continue
             if targets:
                 try:
                     ik = self.robot_manager.current_ik_state_batch(names)
@@ -442,22 +626,85 @@ class EnvFrameFranka(Robot):
                         # the whole error every tick (gain ~100) and ring (springy).
                         dx = compute_pose_error(pos_cur, quat_cur, pos_des, quat_des)
                         v_ee = self.config.cart_gain * dx
-                        dq = dls_delta_q(J, v_ee, lam=self.config.dls_lambda)
-                        dq_cmd = np.clip(dq, -v_max, v_max)
+                        limit_aware = (
+                            self.config.joint_limit_safety_margin_rad > 0.0
+                            or self.config.joint_limit_velocity_scale < 1.0
+                            or self.config.joint_limit_avoidance_gain > 0.0
+                            or self.config.abort_on_joint_limit
+                        )
+                        if limit_aware:
+                            solution = joint_limit_aware_dls_velocity(
+                                q,
+                                J,
+                                v_ee,
+                                lam=self.config.dls_lambda,
+                                max_joint_velocity=v_max,
+                                position_margin_rad=self.config.joint_limit_safety_margin_rad,
+                                velocity_scale=self.config.joint_limit_velocity_scale,
+                                nullspace_gain=self.config.joint_limit_avoidance_gain,
+                            )
+                            dq_requested = solution.requested
+                            dq_cmd = solution.command
+                        else:
+                            # Preserve the original controller exactly unless the
+                            # caller explicitly opts into joint-limit handling.
+                            dq_requested = dls_delta_q(
+                                J, v_ee, lam=self.config.dls_lambda
+                            )
+                            dq_cmd = np.clip(dq_requested, -v_max, v_max)
+
+                        # Calibration uses a nonzero margin and opts into an
+                        # abort here. Silently sitting on a zero outward bound
+                        # would leave the pose error active forever and recreate
+                        # the recover/retry behavior one layer later in Control.
+                        margin = self.config.joint_limit_safety_margin_rad
+                        if self.config.abort_on_joint_limit and margin > 0.0:
+                            upper_distance = FR3_Q_MAX - q
+                            lower_distance = q - FR3_Q_MIN
+                            upper_hit = (
+                                (solution.requested > solution.upper + 1.0e-6)
+                                & (upper_distance <= 1.5 * margin)
+                            )
+                            lower_hit = (
+                                (solution.requested < solution.lower - 1.0e-6)
+                                & (lower_distance <= 1.5 * margin)
+                            )
+                            hit = np.flatnonzero(upper_hit | lower_hit)
+                            if hit.size:
+                                i = int(hit[0])
+                                raise JointLimitSafetyError(
+                                    f"arm {arm} joint {i + 1} approaching limit: "
+                                    f"q={q[i]:.5f} rad, requested={solution.requested[i]:.5f} "
+                                    f"rad/s, allowed=[{solution.lower[i]:.5f}, "
+                                    f"{solution.upper[i]:.5f}] rad/s, hard range="
+                                    f"[{FR3_Q_MIN[i]:.5f}, {FR3_Q_MAX[i]:.5f}] rad"
+                                )
+
                         cmds[arm] = dq_cmd.tolist()
                         dbg[arm] = (
                             float(np.linalg.norm(pos_des - pos_cur)),
-                            float(np.linalg.norm(dq)),           # |dq| (rad/s) before clamp
+                            float(np.linalg.norm(dq_requested)),
                             float(np.max(np.abs(dq_cmd))),
                             float(np.linalg.norm(J)),            # |J|: 0 => zero Jacobian (bad read)
                         )
                     if cmds:
                         self.robot_manager.move_joint_velocity_batch(cmds)
                         sends += 1
-                except Exception:
-                    # Never let a transient RPyC/read error kill the loop; warn
-                    # and retry next tick (the driver also self-recovers known
-                    # recoverable franky faults).
+                except Exception as e:
+                    fatal = isinstance(e, (JointLimitSafetyError, MotionCommandError))
+                    if fatal:
+                        try:
+                            self.robot_manager.move_joint_velocity_batch(
+                                {arm: _ZERO_JV for arm in targets}
+                            )
+                        except Exception:
+                            pass
+                        with self._target_lock:
+                            self._ik_error = e
+                            self._targets = {}
+                        self._ik_stop.set()
+                        logger.exception("IK loop stopped after a safety/driver error")
+                        break
                     logger.exception("IK loop tick failed; retrying next tick")
             ticks += 1
             # Heartbeat ~1 Hz: achieved tick rate + per-arm pose error and the
@@ -496,6 +743,15 @@ class EnvFrameFranka(Robot):
         if not self.is_connected:
             raise ConnectionError(f"{self} is not connected.")
 
+        # Stop the joint_ik stream first: home() drives its own joint-velocity PD,
+        # and a live IK thread would push competing velocities on the same arms
+        # (both call move_joint_velocity_batch). Clearing _targets means the next
+        # send_action re-seeds the held target from the post-home pose, so the arm
+        # doesn't lurch back toward the pre-home target. Safe to re-home per episode.
+        self._stop_ik_thread()
+        with self._target_lock:
+            self._targets = {}
+
         targets = {a: np.asarray(q, dtype=np.float64) for a, q in targets_q.items() if a in self.active_arms}
         if not targets:
             return True
@@ -522,7 +778,13 @@ class EnvFrameFranka(Robot):
                 if dt < period:
                     time.sleep(period - dt)
         finally:
-            self.robot_manager.stop_all_joint_motion()
+            # Best-effort stop; the async zero-velocity command decays the arm on
+            # its own, and the gather is bounded (STOP_TIMEOUT_S), so a wedged
+            # connection can't leave home() hanging.
+            try:
+                self.robot_manager.stop_all_joint_motion()
+            except Exception:
+                logger.exception("error stopping joint motion after home")
         return converged
 
     # ------------------------------------------------------------------
@@ -541,7 +803,12 @@ class EnvFrameFranka(Robot):
         return out
 
     def _env_to_base(self, arm: str, p_te: np.ndarray, q_te_xyzw: np.ndarray) -> np.ndarray:
-        """env-frame target (pos, quat xyzw) -> base-frame 4x4 homogeneous matrix."""
+        """env-frame link8 target (pos, quat xyzw) -> base-frame O_T_EE 4x4.
+
+        The env-frame pose is the panda_link8 frame (sim's controlled frame). The
+        twist/IK loops track franky's O_T_EE, so the link8 target is shifted by
+        ``link8_to_ee`` to the O_T_EE target the loops compare against.
+        """
         R_be, p_be = self._base[arm]
         R_be_inv = R_be.inv()
         p_tb = R_be_inv.apply(p_te - p_be)
@@ -549,10 +816,15 @@ class EnvFrameFranka(Robot):
         T = np.eye(4)
         T[:3, :3] = R_tb.as_matrix()
         T[:3, 3] = p_tb
-        return T
+        return T @ self._link8_to_ee
 
     def _base_to_env(self, arm: str, T_eb: np.ndarray):
-        """base-frame measured 4x4 pose -> env-frame (pos, quat xyzw)."""
+        """base-frame measured O_T_EE 4x4 -> env-frame link8 (pos, quat xyzw).
+
+        franky reports O_T_EE; ``ee_to_link8`` shifts it back to panda_link8 so the
+        reported env-frame pose matches sim's controlled frame.
+        """
+        T_eb = T_eb @ self._ee_to_link8
         R_be, p_be = self._base[arm]
         p_eb = T_eb[:3, 3]
         R_eb = Rotation.from_matrix(T_eb[:3, :3])

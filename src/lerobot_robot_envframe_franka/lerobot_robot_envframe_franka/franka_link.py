@@ -100,6 +100,10 @@ _RECOVERABLE_ERRORS = (
     "Attempted to start multiple motions",
 )
 
+
+class MotionCommandError(RuntimeError):
+    """A driver motion command failed after best-effort robot recovery."""
+
 # (q, dq, O_T_EE, twist): q/dq are the 7-vector joint angles/velocities, O_T_EE is
 # a 4x4 homogeneous transform and twist is the 6-vector EE velocity (linear,
 # angular). O_T_EE and twist are in the arm's own base frame. dq is read for
@@ -235,7 +239,9 @@ class RobotDriver:
 
     def __init__(self, server_ip: str, robot_ip: str, port: int,
                  stiffness: tuple[float, ...] = _DEFAULT_JOINT_STIFFNESS,
-                 dynamics: tuple[float, ...] = _DEFAULT_JP_RELATIVE_DYNAMICS):
+                 dynamics: tuple[float, ...] = _DEFAULT_JP_RELATIVE_DYNAMICS,
+                 raise_motion_errors: bool = False):
+        self._raise_motion_errors = bool(raise_motion_errors)
         self._lock = threading.Lock()
         self._conn = rpyc.classic.connect(server_ip, port)
         self._conn._config["sync_request_timeout"] = RPYC_TIMEOUT_S
@@ -340,6 +346,11 @@ class RobotDriver:
                 except Exception:
                     pass
             logger.warning("%s: %s", label, e)
+            # Calibration recovers once, then stops instead of reissuing the
+            # same unsafe target on the next IK tick.
+            if self._raise_motion_errors:
+                raise MotionCommandError(f"{label}: {_short_exc(e)}") from e
+
 
     def stop(self) -> None:
         self._stop_via(self._rpc_stop, "stop")
@@ -390,10 +401,13 @@ class MultiRobotWrapper:
 
     def add_robot(self, name: str, server_ip: str, robot_ip: str, port: int,
                   stiffness: tuple[float, ...] = _DEFAULT_JOINT_STIFFNESS,
-                  dynamics: tuple[float, ...] = _DEFAULT_JP_RELATIVE_DYNAMICS) -> None:
+                  dynamics: tuple[float, ...] = _DEFAULT_JP_RELATIVE_DYNAMICS,
+                  raise_motion_errors: bool = False) -> None:
         if name in self.drivers:
             raise ValueError(f"Robot '{name}' already connected")
-        self.drivers[name] = RobotDriver(server_ip, robot_ip, port, stiffness, dynamics)
+        self.drivers[name] = RobotDriver(
+            server_ip, robot_ip, port, stiffness, dynamics, raise_motion_errors
+        )
 
     @property
     def num_alive(self) -> int:
