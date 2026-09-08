@@ -57,7 +57,7 @@ MIRROR_SIGN = np.array([-1, 1, -1, 1, -1, 1, -1], dtype=np.float64)
 # mirrored y, ~3mm in x). The sim's own RIGHT default is NOT used because its j1
 # (+0.44) isn't the mirror of left's (-0.61), leaving the EE x ~6cm asymmetric.
 _DEFAULT_POSE = {
-    "r_q": [0.386806, -0.385042, -0.186271, -2.152199, -0.087768, 1.783421, -2.8973],
+    "r_q": [0.798278, -0.456592, -0.194462, -2.28365, -0.0858621, 1.86411, -2.45589],
     "l_q": [-0.175094, -0.627147, 0.185696, -2.502019, 0.058785, 2.023367, 1.523493],
 }
 
