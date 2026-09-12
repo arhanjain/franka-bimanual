@@ -74,6 +74,8 @@ class ArvCamera(Camera):
         self._stream: Aravis.Stream | None = None
         self._payload: int = 0
         self._last_frame: np.ndarray | None = None
+        self._frame_sequence = 0
+        self._last_frame_monotonic_s = 0.0
 
         # Rolling FPS diagnostics — logs measured rate every 100 frames.
         self._fps_times: list[float] = []
@@ -91,12 +93,24 @@ class ArvCamera(Camera):
     def is_connected(self) -> bool:
         return self._camera is not None and self._stream is not None
 
+    @property
+    def frame_sequence(self) -> int:
+        """Number of successfully decoded frames since construction/connect."""
+        return self._frame_sequence
+
+    @property
+    def last_frame_monotonic_s(self) -> float:
+        """Local monotonic completion time of the last fresh decoded frame."""
+        return self._last_frame_monotonic_s
+
     @staticmethod
     def find_cameras() -> list[dict[str, Any]]:
         raise NotImplementedError("Don't use find cameras here")
 
     def connect(self, warmup: bool = True) -> None:
         self.disconnect()
+        self._frame_sequence = 0
+        self._last_frame_monotonic_s = 0.0
         device = Aravis.open_device(self._ip)
         camera = Aravis.Camera.new_with_device(device)
         self._configure_camera(camera)
@@ -197,6 +211,8 @@ class ArvCamera(Camera):
                     logger.debug("Dropped frame %s @ %s: %s", self._name, self._ip, exc)
                 else:
                     self._last_frame = frame
+                    self._frame_sequence += 1
+                    self._last_frame_monotonic_s = time.monotonic()
                     self._record_fps()
                     return frame.copy()
         finally:

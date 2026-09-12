@@ -30,6 +30,9 @@ dependencies = [
     "net_franky",
     "PyGObject<3.52",
     "pyspacemouse>=2.0",
+    "panda_control",
+    "h5py>=3.10",
+    "pillow>=10",
     "dynamixel-sdk>=3.8",
     "scipy",
     "tyro",
@@ -73,5 +76,6 @@ lerobot_robot_bimanual_franka = { path = "src/lerobot_robot_bimanual_franka", ed
 lerobot_robot_envframe_franka = { path = "src/lerobot_robot_envframe_franka", editable = true  }
 lerobot_teleoperator_gello = { path = "src/lerobot_teleoperator_gello", editable = true }
 lerobot_teleoperator_spacemouse = { path = "src/lerobot_teleoperator_spacemouse", editable = true  }
+panda_control = { path = "../panda_control", editable = true }
 pyrealsense2 = { path = "/home/qirico/librealsense2/wrappers/python"}
 openpi-client = { git = "https://github.com/Physical-Intelligence/openpi.git", subdirectory = "packages/openpi-client", branch = "main" }

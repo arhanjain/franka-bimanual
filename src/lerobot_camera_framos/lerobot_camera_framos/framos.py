@@ -65,6 +65,8 @@ class FramosCamera(Camera):
         self._profile: rs.pipeline_profile | None = None
         self._aligner: rs.align | None = None
         self._last_color: np.ndarray | None = None
+        self._frame_sequence = 0
+        self._last_frame_monotonic_s = 0.0
         self._last_depth: np.ndarray | None = None
         self._vertices: np.ndarray | None = None
         self._depth_scale: float = 0.001
@@ -86,6 +88,16 @@ class FramosCamera(Camera):
     @property
     def is_connected(self) -> bool:
         return self._pipeline is not None and self._profile is not None
+
+    @property
+    def frame_sequence(self) -> int:
+        """Number of fresh color frames decoded since construction/connect."""
+        return self._frame_sequence
+
+    @property
+    def last_frame_monotonic_s(self) -> float:
+        """Local monotonic completion time of the last fresh color frame."""
+        return self._last_frame_monotonic_s
 
     @staticmethod
     def find_cameras() -> list[dict[str, Any]]:
@@ -109,6 +121,8 @@ class FramosCamera(Camera):
 
     def connect(self, warmup: bool = False) -> None:
         self.disconnect()
+        self._frame_sequence = 0
+        self._last_frame_monotonic_s = 0.0
 
         cfg = rs.config()
         # Prefer pinning the device by serial number when supplied; otherwise
@@ -347,6 +361,8 @@ class FramosCamera(Camera):
             if arr.ndim == 3 and arr.shape[2] == 3 and self._config.color_format.lower() == "bgr8":
                 arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
             self._last_color = arr
+            self._frame_sequence += 1
+            self._last_frame_monotonic_s = time.monotonic()
             return arr.copy()
 
     def _apply_options(self, device: rs.device) -> None:

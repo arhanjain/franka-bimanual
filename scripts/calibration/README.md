@@ -194,8 +194,15 @@ Wrist cam:
 {
   "view": "wrist_right_minus",
   "image_size": [960, 600],
-  "intrinsics": { "source": "charuco_calibrateCamera", "matrix": [[...]],
-                  "distortion": [...], "reproj_rms_px": 0.129, "n_views": 56 },
+  "intrinsics": { "source": "charuco_fisheye_calibrate", "model": "opencv_fisheye",
+                  "matrix": [[...]], "distortion": [...], "reproj_rms_px": 0.129, "n_views": 56 },
+  "isaac_sim_fisheye_polynomial": {
+    "projection_type": "fisheyePolynomial",
+    "fisheye_nominal_width": 960.0, "fisheye_nominal_height": 600.0,
+    "fisheye_optical_centre_x": ..., "fisheye_optical_centre_y": ...,
+    "fisheye_max_fov": ..., "fisheye_polynomial_a": ..., "...": "...",
+    "fit_rms_px": ..., "fit_max_px": ...
+  },
   "handeye": {
     "method": "shah", "n_views": 56,
     "base_T_env": [[...]],                       // env(board-center) pose in the base
@@ -210,6 +217,26 @@ Wrist cam:
 
 The top-level `base_in_env` block is shaped for direct paste-in to
 `EnvFrameFrankaConfig.base_in_env[arm] = (xyz, quat_wxyz)`.
+
+Each wrist solve also writes `isaac_sim_fisheye_polynomial`. It is a fitted
+inverse f-theta representation of the `opencv_fisheye` intrinsics, ready to
+paste into Isaac Sim's legacy `FisheyeCameraCfg`. Do **not** copy OpenCV's
+`k1`--`k4` values into the `fisheye_polynomial_*` fields: they parameterize the
+opposite mapping. The result includes source-domain RMS/max pixel residuals and
+full-sensor monotonicity metadata. A new solve limits the measured source fit
+to observed ChArUco rays; the standalone backfill tool has no such observations
+and therefore uses 95% of the source model's monotonic FOV. In both cases, the
+helper adds a conservative, smooth monotonic extension from that source range
+to the furthest rectangular-sensor corner. It prevents an inner-field
+polynomial from extrapolating into top/bottom render artifacts. `--max-fov-deg`
+selects a smaller source range before that extension:
+
+```bash
+.venv/bin/python scripts/calibration/fit_fisheye_polynomial.py \
+  scripts/calibration/results/wrist_left_plus.json
+.venv/bin/python scripts/calibration/fit_fisheye_polynomial.py \
+  scripts/calibration/results/wrist_right_minus.json --max-fov-deg 130
+```
 
 **Quality targets:** reprojection RMS **< 0.5 px** (the current wrist solves come
 in near 0.13 px, scene ~0.41 px). Beyond the numbers, check the
@@ -233,6 +260,11 @@ Results are written non-destructively; apply them yourself after review.
   them per camera from the `extrinsics` block here.
 - **Wrist `cam_in_ee`** — recovered but not yet consumed anywhere in the stack;
   it's there for whatever needs to project wrist observations into the env frame.
+- **Wrist fisheye intrinsics** — paste the matching
+  `isaac_sim_fisheye_polynomial` block into the wrist `FisheyeCameraCfg` in the
+  sim configuration. Keep the generic focal/aperture values unless depth of
+  field is being tuned; legacy f-theta projection uses its dedicated fisheye
+  fields.
 
 ## Known issue
 

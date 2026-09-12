@@ -91,6 +91,9 @@ class WSG:
         self._state_lock = threading.Lock()
         self._position_mm: float | None = None
         self._gripper_state: int | None = None
+        self._last_position_monotonic_s = 0.0
+        self._last_rx_monotonic_s = 0.0
+        self._io_error: str | None = None
 
         # All sender state — the streaming target, queued one-shots,
         # and pending waiters — live behind ``_cond``'s lock.
@@ -130,6 +133,28 @@ class WSG:
         """Last known GRIPSTATE integer; never blocks."""
         with self._state_lock:
             return self._gripper_state
+
+    @property
+    def position_age_s(self) -> float:
+        """Seconds since the last parsed POS response; infinity before the first."""
+        with self._state_lock:
+            stamp = self._last_position_monotonic_s
+        return float("inf") if stamp <= 0.0 else time.monotonic() - stamp
+
+    @property
+    def health_error(self) -> str | None:
+        """Latched transport/thread error suitable for recorder invalidation."""
+        with self._state_lock:
+            io_error = self._io_error
+        if io_error:
+            return io_error
+        if self._closed.is_set():
+            return "driver is closed"
+        if not self._reader_thread.is_alive():
+            return "reader thread stopped"
+        if not self._sender_thread.is_alive():
+            return "sender thread stopped"
+        return None
 
     def move(self, position_mm: float, speed: float = 1.0, blocking: bool = False) -> bool:
         """Stream a new target position (mm).
@@ -227,10 +252,16 @@ class WSG:
                 chunk = self._sock.recv(self._RECV_BUF_SIZE)
             except socket.timeout:
                 continue
-            except OSError:
+            except OSError as exc:
+                with self._state_lock:
+                    self._io_error = f"receive failed: {exc}"
                 break
             if not chunk:
+                with self._state_lock:
+                    self._io_error = "peer closed the connection"
                 break
+            with self._state_lock:
+                self._last_rx_monotonic_s = time.monotonic()
             buf += chunk
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
@@ -245,6 +276,7 @@ class WSG:
             try:
                 with self._state_lock:
                     self._position_mm = float(text.split("=", 1)[1])
+                    self._last_position_monotonic_s = time.monotonic()
             except ValueError:
                 pass
         elif text.startswith("GRIPSTATE="):
@@ -341,6 +373,8 @@ class WSG:
                 self._sock.sendall(data)
             return True
         except OSError as e:
+            with self._state_lock:
+                self._io_error = f"send failed: {e}"
             if self.do_print:
                 print(f"{self.name}: [WSG] send error: {e}")
             return False
@@ -358,6 +392,8 @@ class WSG:
             self._cond.notify()
 
         if not waiter.event.wait(timeout=timeout_s):
+            with self._state_lock:
+                self._io_error = f"timeout waiting for {expected!r}"
             with self._cond:
                 try:
                     self._waiters.remove(waiter)
