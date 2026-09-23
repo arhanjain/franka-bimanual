@@ -20,10 +20,11 @@ Architecture (one socket, two threads):
 * ``move()`` hot path  clamps the value, stores it as the latest
   target, and notifies the sender.  The sender wakes within
   microseconds and the ``MOVE`` hits the wire immediately.  Repeat
-  calls with the same (or near-same) target are a no-op, which is
+  calls with the same (or near-same) target are normally a no-op, which is
   what keeps the gripper from feeling laggy: each commanded motion
   runs to completion instead of being interrupted by another MOVE
-  every loop tick.
+  every loop tick. A full-open target is retried once if fresh position
+  feedback shows that the first move did not open the gripper.
 
 Public API:
     move(position, blocking=False)   stream a target position (mm)
@@ -61,8 +62,11 @@ class WSG:
     # Rate caps.  ``_MIN_MOVE_INTERVAL_S`` keeps overlapping motion plans
     # from piling up at the gripper, ``_TARGET_CHANGE_THRESH_MM`` absorbs
     # noisy teleop input without an actual dead-zone.
-    _MIN_MOVE_INTERVAL_S = 0.1       # ~20 Hz max MOVE rate
+    _MIN_MOVE_INTERVAL_S = 0.1       # ~10 Hz max MOVE rate
     _TARGET_CHANGE_THRESH_MM = 5.0
+    _OPEN_POSITION_TOLERANCE_MM = 5.0
+    _OPEN_RETRY_DELAY_S = 1.0
+    _OPEN_POSITION_MAX_AGE_S = 0.5
     _POS_POLL_INTERVAL_S = 0.050       # ~20 Hz POS? poll
     _SOCK_RECV_TIMEOUT_S = 0.5
     _RECV_BUF_SIZE = 4096
@@ -101,6 +105,7 @@ class WSG:
         self._target_mm: float | None = None
         self._last_sent_target_mm: float | None = None
         self._last_move_send_t: float = 0.0
+        self._open_retry_count = 0
         self._cmd_queue: deque[tuple[bytes, _Waiter | None]] = deque()
         self._waiters: deque[_Waiter] = deque()
 
@@ -161,7 +166,8 @@ class WSG:
 
         Non-blocking by default: the latest target is published to the
         sender thread which wakes immediately and emits ``MOVE`` on the
-        wire.  Repeat calls with the same target are coalesced.
+        wire. Repeat calls with the same target are coalesced unless a
+        full-open move has not reached its target after the retry delay.
 
         * position 10  – fully closed (lower clamp)
         * position 100 – fully open  (upper clamp)
@@ -305,6 +311,9 @@ class WSG:
         last_pos_poll_t = 0.0
         while not self._closed.is_set():
             cmd_to_send: bytes | None = None
+            with self._state_lock:
+                position_mm = self._position_mm
+                position_stamp = self._last_position_monotonic_s
             with self._cond:
                 if self._closed.is_set():
                     break
@@ -319,13 +328,24 @@ class WSG:
                 else:
                     now = time.monotonic()
                     target_dirty = self._target_dirty_locked()
+                    open_retry_due = self._open_retry_due_locked(
+                        now, position_mm, position_stamp
+                    )
+                    if open_retry_due and self._open_retry_count >= 1:
+                        with self._state_lock:
+                            if self._io_error is None:
+                                self._io_error = (
+                                    f"open target {self.GRIPPER_MAX_MM:.1f} mm not reached "
+                                    f"after retry (measured {position_mm:.1f} mm)"
+                                )
+                        open_retry_due = False
 
                     if (
-                        target_dirty
-                        or (now - self._last_move_send_t) >= self._MIN_MOVE_INTERVAL_S
-                        and self._target_mm is not None
+                        (target_dirty or open_retry_due)
+                        and (now - self._last_move_send_t) >= self._MIN_MOVE_INTERVAL_S
                     ):
                         target = self._target_mm
+                        self._open_retry_count = 0 if target_dirty else 1
                         self._last_sent_target_mm = target
                         self._last_move_send_t = now
                         cmd_to_send = self._move_cmd(target)
@@ -354,6 +374,22 @@ class WSG:
         if self._last_sent_target_mm is None:
             return True
         return abs(self._target_mm - self._last_sent_target_mm) >= self._TARGET_CHANGE_THRESH_MM
+
+    def _open_retry_due_locked(
+        self, now: float, position_mm: float | None, position_stamp: float
+    ) -> bool:
+        """Retry only a stalled full-open move, never a grasp against an object."""
+        if (
+            self._target_mm != self.GRIPPER_MAX_MM
+            or self._last_sent_target_mm != self.GRIPPER_MAX_MM
+            or position_mm is None
+            or now - position_stamp > self._OPEN_POSITION_MAX_AGE_S
+        ):
+            return False
+        if position_mm >= self.GRIPPER_MAX_MM - self._OPEN_POSITION_TOLERANCE_MM:
+            self._open_retry_count = 0
+            return False
+        return now - self._last_move_send_t >= self._OPEN_RETRY_DELAY_S
 
     # ------------------------------------------------------------------
     # Internals
