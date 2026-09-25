@@ -21,6 +21,10 @@ Run in the REAL venv (``third_party/franka-bimanual/.venv``):
   # Scene cameras plus only luigi's (right-arm) wrist camera:
   python scripts/overlay_sim_render.py --arms r --sim-image /path/to/sim_render_9.png
 
+Add --move-arms-to-sim-reset to move both real arms to the seven-joint
+configuration saved for --sim-image in its sibling reset_state_manifest.json.
+Without the flag, this tool connects cameras only.
+
 Keys: q/ESC quit; [ and ] decrease/increase real-image opacity; s save the
 current grid to ``--out``.
 
@@ -32,12 +36,16 @@ using this tool.
 Usage:
 
 .venv/bin/python scripts/overlay_sim_render.py \
-  --sim-image /home/qirico/qirico/sim-improvement-aug26/experiments/dataset_generation/resets/sim_render_1.png
+  --sim-image /home/qirico/qirico/sim-improvement-aug26/experiments/dataset_generation/resets/reset_states_settled_sep19masses_sep25calib/sim_render_1.png \
+  --move-arms-to-sim-reset
 """
 
 from __future__ import annotations
 
+import json
+import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -79,6 +87,104 @@ class Args:
     """Maximum CV2 display refresh rate; camera reads may limit the actual rate."""
     out: str = "sim_real_overlay.png"
     """PNG written when s is pressed."""
+    move_arms_to_sim_reset: bool = False
+    """Move both real arms to the saved sim joints for --sim-image."""
+
+
+def load_sim_reset_joints(sim_image: str) -> dict[str, np.ndarray]:
+    """Validate both arm targets from the manifest entry for this render."""
+    image_path = Path(sim_image).expanduser().resolve()
+    manifest_path = image_path.with_name("reset_state_manifest.json")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"could not read reset manifest {manifest_path}: {error}") from error
+    if manifest.get("schema_version") != 1:
+        raise ValueError(f"unsupported reset manifest schema in {manifest_path}")
+
+    entries = manifest.get("entries")
+    if not isinstance(entries, list):
+        raise ValueError(f"missing reset entries in {manifest_path}")
+    matches = [
+        entry
+        for entry in entries
+        if isinstance(entry, dict)
+        and isinstance(entry.get("image"), str)
+        and (manifest_path.parent / entry["image"]).resolve() == image_path
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"expected one manifest entry for {image_path}, found {len(matches)}"
+        )
+
+    repo_root = Path(__file__).resolve().parents[3]
+    sys.path.insert(0, str(repo_root / "scripts" / "teleop"))
+    from real_teleop_common import PANDA_Q_MAX, PANDA_Q_MIN
+
+    targets: dict[str, np.ndarray] = {}
+    expected_names = [f"panda_joint{index}" for index in range(1, 8)]
+    for side in ("left", "right"):
+        try:
+            robot = matches[0]["robots"][side]
+            names = list(robot["joint_names"])
+            joints = np.asarray(robot["joint_position_rad"], dtype=np.float64)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"invalid {side} arm reset in {manifest_path}") from error
+        if names[:7] != expected_names or joints.shape != (len(names),):
+            raise ValueError(f"unexpected {side} joint layout in {manifest_path}")
+        target = joints[:7]
+        if (
+            not np.isfinite(target).all()
+            or np.any(target < PANDA_Q_MIN)
+            or np.any(target > PANDA_Q_MAX)
+        ):
+            raise ValueError(
+                f"{side} reset joints are outside the Panda nominal limits"
+            )
+        targets[side] = target
+    return targets
+
+
+def move_arms_to_sim_reset(targets: dict[str, np.ndarray]) -> None:
+    """Move both real arms in joint space, as in rollout_pretrained_real.py."""
+    repo_root = Path(__file__).resolve().parents[3]
+    sys.path.insert(0, str(repo_root / "third_party" / "panda_control" / "python"))
+    from panda_control.config import load_config
+    from panda_control.remote_client import RemotePandaClient
+
+    configs = {
+        "left": repo_root / "third_party" / "panda_control" / "config" / "mario.yaml",
+        "right": repo_root / "third_party" / "panda_control" / "config" / "luigi.yaml",
+    }
+    clients = {}
+    try:
+        for side in ("left", "right"):
+            clients[side] = RemotePandaClient(load_config(configs[side]))
+            clients[side].wait_for_state(timeout_s=3.0)
+        print("[overlay_sim_render] moving both real arms to the selected sim reset joints ...")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            moves = {
+                side: pool.submit(clients[side].move_to_q, targets[side])
+                for side in ("left", "right")
+            }
+            for move in moves.values():
+                move.result()
+        for side in ("left", "right"):
+            state = clients[side].get_state(fresh=True)
+            measured = None if state is None else np.asarray(state.q, dtype=np.float64)
+            if (
+                measured is None
+                or measured.shape != (7,)
+                or not np.isfinite(measured).all()
+                or np.max(np.abs(measured - targets[side])) > 0.05
+            ):
+                raise RuntimeError(
+                    f"{side} arm did not reach the selected sim reset joints"
+                )
+        print("[overlay_sim_render] both arms reached the selected sim reset joints")
+    finally:
+        for client in clients.values():
+            client.close()
 
 
 def _to_uint8_rgb(frame: object) -> np.ndarray:
@@ -191,8 +297,16 @@ def main() -> None:
 
     try:
         sim = load_default_reset_render(args.sim_image)
+        targets = (
+            load_sim_reset_joints(args.sim_image)
+            if args.move_arms_to_sim_reset
+            else None
+        )
     except ValueError as error:
         raise SystemExit(f"[overlay_sim_render] {error}") from error
+
+    if targets is not None:
+        move_arms_to_sim_reset(targets)
 
     from lerobot_robot_envframe_franka import EnvFrameFranka, EnvFrameFrankaConfig
 
@@ -202,7 +316,7 @@ def main() -> None:
         )
     )
     print(f"[overlay_sim_render] loaded {args.sim_image}")
-    print(f"[overlay_sim_render] connecting cameras only (arms={args.arms}; arms may be offline) ...")
+    print(f"[overlay_sim_render] connecting cameras (arms={args.arms}; arms may be offline) ...")
     robot.connect_cameras()
 
     alpha = float(np.clip(args.real_alpha, 0.0, 1.0))
