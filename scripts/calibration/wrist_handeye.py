@@ -126,13 +126,13 @@ HOME_Q = HOME_Q_BY_ARM[ARM]
 # RIGHT-arm trajectory params. The LEFT arm mirrors these across the env x-axis
 # (y -> -y on AIM_POINT and CENTER_XY); main() applies the mirror per --arm.
 # Point the EE +Z (wrist-cam optical axis) at this env-frame point every tick.
-AIM_POINT = np.array([-0.05, 0.05, 0.0])
+AIM_POINT = np.array([0, 0.05, 0.0])
 # Env-frame xy center (meters) the circles are traced around (shared by all z
 # levels). Set to None to use the measured home EE xy instead.
-CENTER_XY = (-0.05, 0.2)
+CENTER_XY = (0.1, 0.2)
 
 # Env-frame z heights (meters) to run one circle at, in order. One circle per z.
-Z_LEVELS = (0.55, 0.45, 0.4)
+Z_LEVELS = (0.5, 0.4, 0.3, 0.2,)
 
 # Circle in the env xy-plane around CENTER_XY.
 RADIUS = 0.1      # meters
