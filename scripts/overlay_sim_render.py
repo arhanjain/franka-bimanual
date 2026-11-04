@@ -35,7 +35,7 @@ using this tool.
 
 Usage:
 
-.venv/bin/python scripts/overlay_sim_render.py \
+third_party/franka-bimanual/.venv/bin/python third_party/franka-bimanual/scripts/overlay_sim_render.py \
   --sim-image /home/qirico/qirico/sim-improvement-aug26/experiments/dataset_generation/resets/reset_states_settled_sep19masses_sep25calib/sim_render_1.png \
   --move-arms-to-sim-reset
 """
