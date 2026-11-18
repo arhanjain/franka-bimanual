@@ -916,6 +916,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "dynamixel-sdk" },
+    { name = "franka-cameras", extra = ["aravis"] },
     { name = "h5py" },
     { name = "lerobot" },
     { name = "lerobot-camera-arv" },
@@ -941,6 +942,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "dynamixel-sdk", specifier = ">=3.8" },
+    { name = "franka-cameras", extras = ["aravis"], editable = "src/franka_cameras" },
     { name = "h5py", specifier = ">=3.10" },
     { name = "lerobot", specifier = ">=0.5.0" },
     { name = "lerobot-camera-arv", editable = "src/lerobot_camera_arv" },
@@ -962,6 +964,28 @@ requires-dist = [
     { name = "scipy" },
     { name = "tyro" },
 ]
+
+[[package]]
+name = "franka-cameras"
+version = "0.1.0"
+source = { editable = "src/franka_cameras" }
+dependencies = [
+    { name = "numpy" },
+    { name = "opencv-python" },
+]
+
+[package.optional-dependencies]
+aravis = [
+    { name = "pygobject" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "numpy", specifier = ">=1.26" },
+    { name = "opencv-python", specifier = ">=4" },
+    { name = "pygobject", marker = "extra == 'aravis'", specifier = "<3.52" },
+]
+provides-extras = ["aravis"]
 
 [[package]]
 name = "frozenlist"
@@ -1564,6 +1588,7 @@ name = "lerobot-camera-arv"
 version = "0.0.0"
 source = { editable = "src/lerobot_camera_arv" }
 dependencies = [
+    { name = "franka-cameras", extra = ["aravis"] },
     { name = "lerobot" },
     { name = "opencv-python-headless", marker = "sys_platform == 'nonexistent'" },
     { name = "pygobject" },
@@ -1571,6 +1596,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "franka-cameras", extras = ["aravis"], editable = "src/franka_cameras" },
     { name = "lerobot" },
     { name = "opencv-python-headless" },
     { name = "pygobject", specifier = "<3.52" },
@@ -1581,12 +1607,14 @@ name = "lerobot-camera-framos"
 version = "0.0.0"
 source = { editable = "src/lerobot_camera_framos" }
 dependencies = [
+    { name = "franka-cameras" },
     { name = "lerobot" },
     { name = "opencv-python-headless", marker = "sys_platform == 'nonexistent'" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "franka-cameras", editable = "src/franka_cameras" },
     { name = "lerobot" },
     { name = "opencv-python-headless" },
 ]

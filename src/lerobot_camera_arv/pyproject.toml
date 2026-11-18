@@ -8,6 +8,7 @@ version = "0.0.0"
 description = "Aravis camera plugin for LeRobot"
 requires-python = ">=3.10"
 dependencies = [
+    "franka-cameras[aravis]",
     "lerobot",
     "PyGObject<3.52",
     "opencv-python-headless",
@@ -16,3 +17,6 @@ dependencies = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["lerobot_camera_arv*"]
+
+[tool.uv.sources]
+franka-cameras = { path = "../franka_cameras", editable = true }

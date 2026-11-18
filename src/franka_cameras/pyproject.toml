@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "franka-cameras"
+version = "0.1.0"
+description = "Standalone Aravis and FRAMOS camera drivers for the bimanual Franka rig"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.26", "opencv-python>=4"]
+
+[project.optional-dependencies]
+aravis = ["PyGObject<3.52"]
+# pyrealsense2 must come from the FRAMOS SDK build, not the PyPI wheel.
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["franka_cameras*"]

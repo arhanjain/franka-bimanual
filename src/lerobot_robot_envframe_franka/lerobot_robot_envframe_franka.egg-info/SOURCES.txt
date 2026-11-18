@@ -2,6 +2,8 @@ README.md
 pyproject.toml
 lerobot_robot_envframe_franka/__init__.py
 lerobot_robot_envframe_franka/actions.py
+lerobot_robot_envframe_franka/camera_viz.py
+lerobot_robot_envframe_franka/data_collector.py
 lerobot_robot_envframe_franka/diffik.py
 lerobot_robot_envframe_franka/envframe_franka.py
 lerobot_robot_envframe_franka/envframe_franka_config.py

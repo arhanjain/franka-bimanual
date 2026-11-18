@@ -20,6 +20,7 @@ dependencies = [
     "lerobot>=0.5.0",
     # LeRobot core (the CLIs: lerobot-teleoperate/-record/-replay/-train).
     # Workspace members (resolved locally via [tool.uv.sources]).
+    "franka-cameras[aravis]",
     "lerobot_camera_arv",
     "lerobot_camera_framos",
     "lerobot_robot_bimanual_franka",
@@ -70,6 +71,7 @@ override-dependencies = [
 # Resolve intra-repo deps (e.g. bimanual_franka -> camera_arv/camera_framos)
 # from the workspace instead of an index.
 [tool.uv.sources]
+franka-cameras = { path = "src/franka_cameras", editable = true }
 lerobot_camera_arv = { path = "src/lerobot_camera_arv", editable = true }
 lerobot_camera_framos = { path = "src/lerobot_camera_framos", editable = true  }
 lerobot_robot_bimanual_franka = { path = "src/lerobot_robot_bimanual_franka", editable = true  }
